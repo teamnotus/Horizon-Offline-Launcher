@@ -5223,6 +5223,11 @@ pub fn {f}("
                 named == 2 || (optional && named > 2),
                 "game.yml must sign and publish {game} ({os} {arch})"
             );
+            // This fork doesn't publish macOS launcher builds: GitHub kept cancelling those jobs
+            // for lack of a runner, and they aren't used here. Macs still get the game assets.
+            if os == "macos" {
+                continue;
+            }
             assert!(
                 launcher.contains(&format!("asset: {launcher_asset}")),
                 "launcher.yml builds no {launcher_asset}"
