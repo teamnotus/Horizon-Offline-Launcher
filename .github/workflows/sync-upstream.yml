@@ -67,6 +67,29 @@ jobs:
           # Upstream folded content mods into a new mod system; the offline launcher still uses
           # this crate, so keep it and put it back in the workspace.
           git checkout origin/main -- crates/horizon-mods
+          # Upstream's shader API now checks its version while reading a pack; the fork's registry
+          # still refers to the type that API removed. Keep the crate compiling on both trees.
+          if ! grep -Rsq 'pub enum Api' crates/horizon-shader-api/src; then
+            python3 - <<'PY'
+          from pathlib import Path
+          p = Path('crates/horizon-mods/src/index.rs')
+          s = p.read_text()
+          start = s.index('            // Players get only what the game draws without a switch')
+          end = s.index('        Kind::ShaderPack =>', start)
+          new = "\n".join([
+              "            // Upstream's shader API checks its own version when it reads the pack.",
+              "            Ok(Facts {",
+              "                id: Some(m.id),",
+              "                version: Some(m.version),",
+              "                api: horizon_shader_api::API.to_owned(),",
+              "                ..Facts::default()",
+              "            })",
+              "        }",
+              "",
+          ])
+          p.write_text(s[:start] + new + s[end:])
+          PY
+          fi
           python3 - <<'PY'
           from pathlib import Path
           p = Path('Cargo.toml')
@@ -93,6 +116,87 @@ jobs:
           ! grep -q 'download_for_owner' launcher/src/backend.rs
           grep -q 'MogBSp7EXM7IvkdnlwA5lwGb1HEu3uHTm4cHQHcnQEk=' crates/horizon-release-sign/release-keys.txt
           test -f .github/workflows/game.yml
+      - name: Adapt the launcher to upstream's current APIs
+        if: steps.sync.outputs.up_to_date == '0'
+        run: |
+          set -euo pipefail
+          # Upstream moved NBT to horizon-core; the launcher imports it from horizon-world.
+          # One re-export lets the same launcher source compile against both trees.
+          if ! grep -q 'pub mod nbt' crates/horizon-world/src/lib.rs; then
+            printf '\npub use horizon_core::nbt;\n' >> crates/horizon-world/src/lib.rs
+          fi
+          # Upstream renamed the Nightly helpers; keep the names the launcher and its tests call.
+          if ! grep -q 'pub fn nightly_title_version' crates/horizon-release-sign/src/lib.rs; then
+            cat >> crates/horizon-release-sign/src/lib.rs <<'RS'
+
+          pub fn nightly_title_version(title: &str) -> Option<String> {
+              build_title_version(Channel::Nightly, title)
+          }
+
+          pub fn nightly_digest(
+              version: &str,
+              asset: &str,
+              sums: Option<&[u8]>,
+              signature: Option<&str>,
+              keys: &[PublicKey],
+          ) -> Result<String, String> {
+              build_digest(Channel::Nightly, version, asset, sums, signature, keys)
+          }
+          RS
+          fi
+          # Upstream dropped the trait-injection API the launcher still uses to build native
+          # mods pinned to older source revisions. Put that API beside upstream's generated one.
+          if ! grep -q 'pub fn inject' crates/horizon-mod-api-gen/src/lib.rs; then
+            git show origin/main:crates/horizon-mod-api-gen/src/injection.rs > crates/horizon-mod-api-gen/src/injection.rs
+            git show origin/main:crates/horizon-mod-api-gen/src/build.rs > "$RUNNER_TEMP/fork-mod-api-build.rs"
+            python3 - <<'PY'
+          from pathlib import Path
+          import os
+          src = Path(os.environ['RUNNER_TEMP'] + '/fork-mod-api-build.rs').read_text()
+          start = src.index('#[derive(serde::Deserialize)]')
+          end = src.index('\n}\n', src.index('file.items.extend(structs);')) + len('\n}\n')
+          body = 'use quote::ToTokens;\nuse std::collections::HashSet;\n\n' + src[start:end]
+          Path('crates/horizon-mod-api-gen/src/inject_compat.rs').write_text(body)
+          p = Path('crates/horizon-mod-api-gen/src/lib.rs')
+          s = p.read_text()
+          s = s.replace('pub use catalog::DECLARATIONS;',
+                        'pub use catalog::DECLARATIONS;\nmod injection;\npub use injection::{TraitContract, TraitInjection};\nmod inject_compat;\npub use inject_compat::inject;', 1)
+          p.write_text(s)
+          PY
+          fi
+          # Upstream's modpack porter now takes the hosts it may download from.
+          if grep -q 'pipeline::port(work, resources, from, log)' launcher/src/modpacks.rs; then
+            python3 - <<'PY'
+          from pathlib import Path
+          p = Path('launcher/src/modpacks.rs')
+          s = p.read_text().replace(
+              'pipeline::port(work, resources, from, log)?;',
+              'pipeline::port(\n        work,\n        resources,\n        from,\n        horizon_addresses::MODPACK_DOWNLOAD_HOSTS,\n        log,\n    )?;', 1)
+          p.write_text(s)
+          p = Path('launcher/Cargo.toml')
+          s = p.read_text()
+          if 'horizon-addresses' not in s:
+              s = s.replace('horizon-port-pack = ',
+                            'horizon-addresses = { path = "../crates/horizon-addresses" }\nhorizon-port-pack = ', 1)
+          p.write_text(s)
+          PY
+          fi
+          # Upstream's themes paint a sky mood and a skyline cut; the launcher's two skies
+          # keep their look with the plain ones.
+          if grep -q 'pub mood: Mood' crates/horizon-theme/src/night.rs && ! grep -q 'mood: Mood' launcher/src/themes.rs; then
+            python3 - <<'PY'
+          from pathlib import Path
+          p = Path('launcher/src/themes.rs')
+          s = p.read_text()
+          s = s.replace('use horizon_theme::night::{Night, SkyArt};',
+                        'use horizon_theme::night::{Land, Mood, Night, SkyArt};', 1)
+          for star in ['0xeceff4', '0xffffff']:
+              s = s.replace(f'        star: {star},\n    }},',
+                            f'        star: {star},\n        mood: Mood::Plain,\n        land: Land::Plain,\n    }},', 1)
+          p.write_text(s)
+          PY
+          fi
+          git add -A
       - name: Rebuild the exporter classes when the pinned game files change
         if: steps.sync.outputs.up_to_date == '0'
         run: |
