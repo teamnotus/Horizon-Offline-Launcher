@@ -102,7 +102,7 @@ impl Launcher {
     }
 
     /// The modal, over the page the player was looking at.
-    pub(super) fn ask_name_dialog(&self, cx: &mut Context<Self>) -> Option<Div> {
+    pub(super) fn ask_name_dialog(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let ask = self.ask_name.as_ref()?;
         let focus = ask.focus.as_ref()?;
         let t = self.theme;
@@ -224,14 +224,14 @@ impl Launcher {
                     .justify_end()
                     .gap(px(8.))
                     .child(
-                        ui::button("ask-name-cancel", tr("Cancel"), Kind::Ghost, &t).on_click(
+                        ui::button("ask-name-cancel".into(), tr("Cancel").into(), Kind::Ghost, &t).on_click(
                             cx.listener(|this, _: &ClickEvent, window, cx| {
                                 this.cancel_ask_name(window, cx);
                             }),
                         ),
                     )
                     .child(
-                        ui::button("ask-name-play", tr("Play"), Kind::Primary, &t).on_click(
+                        ui::button("ask-name-play".into(), tr("Play").into(), Kind::Primary, &t).on_click(
                             cx.listener(|this, _: &ClickEvent, window, cx| {
                                 this.confirm_ask_name(window, cx);
                             }),
