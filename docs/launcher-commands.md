@@ -68,9 +68,7 @@ MCP: `prepare`.
 
 ## `horizon-launcher play`
 
-Start the client (offline without a signed-in Microsoft account). In a terminal, when no player is
-chosen, it asks for an offline name (3 to 16 letters, digits or `_`) and keeps it; scripts and MCP
-calls keep the generated name instead.
+Start the client (offline without a signed-in Microsoft account). In a terminal, when no player is chosen, it asks for an offline name (3 to 16 letters, digits or `_`) and keeps it; scripts and MCP calls keep the generated name instead.
 
     horizon-launcher play
 
