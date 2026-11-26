@@ -216,7 +216,12 @@ jobs:
           cp -r mods/horizon/src/test/java/dev/horizonlab/parity/. \
                 "$work/home/versions/local/mods/horizon/src/test/java/dev/horizonlab/parity/"
           touch "$work/home/versions/local/.installed"
-          cargo build --release --manifest-path launcher/Cargo.toml -p horizon-launcher --bin horizon-launcher
+          cargo build --release --manifest-path launcher/Cargo.toml \
+            -p horizon-launcher --bin horizon-launcher \
+            -p horizon-prepare --bin horizon-prepare
+          # A version with these exact sources is prepared in-process; without a binary the
+          # launcher falls back to upstream's Python preparer, which no longer ships in tools/.
+          cp launcher/target/release/horizon-prepare "$work/home/versions/local/horizon-prepare"
           HORIZON_LAUNCHER_HOME="$work/home" HORIZON_LAUNCHER_NO_SELF_UPDATE=1 HORIZON_HOME="$work/game" \
           XDG_DATA_HOME="$work/xdg-data" XDG_CONFIG_HOME="$work/xdg-config" \
             launcher/target/release/horizon-launcher prepare --download --version local
