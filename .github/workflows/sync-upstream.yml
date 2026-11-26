@@ -256,6 +256,8 @@ jobs:
           git add Cargo.lock launcher/Cargo.lock
       - name: Push and open the PR
         if: steps.sync.outputs.up_to_date == '0'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
         run: |
           set -euo pipefail
           git -c user.name='teamnotus' -c user.email='teamnotus@users.noreply.github.com' \
