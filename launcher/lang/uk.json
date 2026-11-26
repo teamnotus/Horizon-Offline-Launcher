@@ -1240,5 +1240,11 @@
   "Found by itself in your launcher's folder. Or pick the {version}.jar file.": "Знайдено самостійно в теці вашого лаунчера. Або виберіть файл {version}.jar.",
   "Minecraft jar": "Jar Minecraft",
   "This build of the launcher has no Microsoft sign-in (HORIZON_MSA_CLIENT_ID).": "У цій збірці лаунчера немає входу Microsoft (HORIZON_MSA_CLIENT_ID).",
-  "Offline launcher {version}": "Офлайн-лаунчер {version}"
+  "Offline launcher {version}": "Офлайн-лаунчер {version}",
+  "3 to 16 letters, numbers or _. You can change it later in Settings → Account.": "3 to 16 letters, numbers or _. You can change it later in Settings → Account.",
+  "Choose your name": "Choose your name",
+  "Horizon plays offline. Pick the name other players will see.": "Horizon plays offline. Pick the name other players will see.",
+  "Offline name [{name}]: ": "Offline name [{name}]: ",
+  "Offline player": "Offline player",
+  "Use 3 to 16 letters, numbers or _.": "Use 3 to 16 letters, numbers or _."
 }

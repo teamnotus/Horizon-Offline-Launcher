@@ -1240,5 +1240,11 @@
   "Found by itself in your launcher's folder. Or pick the {version}.jar file.": "已在你的启动器文件夹中自动找到。或者选择 {version}.jar 文件。",
   "Minecraft jar": "Minecraft jar",
   "This build of the launcher has no Microsoft sign-in (HORIZON_MSA_CLIENT_ID).": "此版本的启动器没有 Microsoft 登录(HORIZON_MSA_CLIENT_ID)。",
-  "Offline launcher {version}": "离线启动器 {version}"
+  "Offline launcher {version}": "离线启动器 {version}",
+  "3 to 16 letters, numbers or _. You can change it later in Settings → Account.": "3 to 16 letters, numbers or _. You can change it later in Settings → Account.",
+  "Choose your name": "Choose your name",
+  "Horizon plays offline. Pick the name other players will see.": "Horizon plays offline. Pick the name other players will see.",
+  "Offline name [{name}]: ": "Offline name [{name}]: ",
+  "Offline player": "Offline player",
+  "Use 3 to 16 letters, numbers or _.": "Use 3 to 16 letters, numbers or _."
 }
