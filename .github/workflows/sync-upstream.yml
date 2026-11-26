@@ -46,10 +46,13 @@ jobs:
           git remote add upstream https://github.com/rdbtCVS/horizon.git || git remote set-url upstream https://github.com/rdbtCVS/horizon.git
           git fetch --no-tags upstream main
           git checkout -B sync/upstream origin/main
+          # Start from upstream's exact tree: a plain `checkout FETCH_HEAD -- .` leaves files
+          # upstream deleted behind (old build scripts then break the new crates).
+          git rm -rf --quiet .
           git checkout FETCH_HEAD -- .
           # What this fork owns: the offline launcher, its releases and its identity.
           rm -rf launcher .github packaging
-          git checkout origin/main -- launcher .github packaging
+          git checkout origin/main -- launcher .github packaging exporters.tar.gz
           git checkout origin/main -- crates/horizon-release-sign/release-keys.txt \
             README.md AGENTS.md install.ps1 install.sh build.ps1
           # Upstream declares hooks in Rust now; a stale fork copy makes its build script fail.
