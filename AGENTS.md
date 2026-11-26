@@ -2,33 +2,35 @@
 
 ## This repository is a fork
 
-This is **Horizon Offline Launcher** (`gerdaroot/Horizon-Offline-Launcher`), a fork of
-[Horizon](https://github.com/horizon-rust/horizon). The fork changes the launcher only:
+This is **Horizon Offline Launcher** (`teamnotus/Horizon-Offline-Launcher`), a fork of
+[Horizon](https://github.com/rdbtCVS/horizon). The fork changes the launcher only:
 
 - Playing needs no Microsoft account (`launcher/src/account.rs`: `launch` never refuses;
   `session_for_game` gives an offline start when there is no session). An account is optional, for
-  online-mode servers and for downloading Minecraft from Mojang.
+  online-mode servers. Minecraft 26.3 comes straight from Mojang, without an account or another launcher.
 - The player can pick the client jar (`Settings::minecraft_jar`, `sources::from_jar`, the
   "Choose jar…" row on Home, `horizon-launcher settings minecraft-jar PATH`). Only the pinned 26.3
   release jar is accepted (its sha1 is in `research-lock.json`). A jar deep in Prism's libraries finds
   Prism's folder; a lone jar (copied to Downloads) takes the libraries and assets of a launcher folder
   that has 26.3 (`backend::minecraft_folders`). AstralRinth (`AstralRinthApp`) is searched like the
   Modrinth App.
-- Updates come only from this fork (`backend::REPO`, also `horizon-server`'s update.rs), signed with
-  its own key (`crates/horizon-release-sign/release-keys.txt`; the private key is the repository's
+- Updates come only from this fork (`backend::REPO = teamnotus/Horizon-Offline-Launcher`, also `horizon-server`'s update.rs), signed with its own key (`crates/horizon-release-sign/release-keys.txt`; the private key is the repository's
   `RELEASE_SIGNING_KEY` secret). The launcher updates itself unless `HORIZON_LAUNCHER_NO_SELF_UPDATE=1`.
 - Releases: a `launcher@X.Y.Z` tag runs `.github/workflows/launcher.yml` (the launcher, GitHub's
   "latest" release, with the Windows installer `Horizon-Offline-Launcher-Setup.exe` from
-  `packaging/windows/setup.iss`, install.ps1 and install.sh). The game ships as Nightlies, as
-  upstream's does: running `.github/workflows/game.yml` (input `upstream`, default `nightly`) builds
-  this fork's horizon-client (Linux, Windows x64 and ARM64, macOS), puts it into that upstream
-  release's files (exporters and the rest come from there), signs them for the nightly channel
-  (SHA256SUMS.sig) and for the build's own version (SHA256SUMS.v2.sig, `ALSO_FOR`, which current
-  launchers require; a Nightly without it is listed but never offered as an update,
-  `backend::game_releases_with`) and publishes the `nightly` pre-release, "Nightly <date> · <fork commit>"
-  (`nightly::version_of`). The Windows ARM64 builds (game and launcher) are optional. Old fork releases `vX.Y.Z[.R]` stay: the fourth
-  number is a fork revision (`backend::release_order`). Native mods take sources and commits from
-  this fork, else from upstream (`native_mods::either_repo`, `backend::UPSTREAM_REPO`).
+  `packaging/windows/setup.iss`, install.ps1 and install.sh). The game ships as Nightlies built from
+  this fork's source: `.github/workflows/game.yml` builds horizon-client (Linux, Windows x64 and
+  ARM64, macOS), packages it (Mojang's files are prepared locally by the launcher), signs the
+  checksums for the nightly channel (SHA256SUMS.sig) and for the build's own version
+  (SHA256SUMS.v2.sig, `ALSO_FOR`, which current launchers require; a Nightly without it is listed
+  but never offered as an update, `backend::game_releases_with`) and publishes the `nightly`
+  pre-release, "Nightly <date> · <fork commit>" (`nightly::version_of`). The Windows ARM64 builds
+  (game and launcher) are optional. Old fork releases `vX.Y.Z[.R]` stay: the fourth number is a
+  fork revision (`backend::release_order`). Native mods take sources and commits from this fork,
+  else from upstream (`native_mods::either_repo`, `backend::UPSTREAM_REPO`).
+- `.github/workflows/sync-upstream.yml` takes crate source from `rdbtCVS/horizon` daily, keeps this
+  fork's launcher and release files, runs the tests and opens an auto-merge PR;
+  `release-on-sync.yml` tags the next launcher release when that PR merges.
 - The protocol reads a compressed packet like vanilla's Inflater: exactly the declared size, without
   needing the stream's end (`horizon-protocol` frame.rs, `Inflater::inflate`).
 - Horizon's GitHub mirror serves upstream's repository only (`github::mirror_url_with`).
@@ -36,7 +38,7 @@ This is **Horizon Offline Launcher** (`gerdaroot/Horizon-Offline-Launcher`), a f
   with `GPUI_DISABLE_DIRECT_COMPOSITION=1` (`main.rs`, `window_failed`); DirectX crashes say what to
   update (`crash_log::graphics_hint`).
 - The owner gate upstream added stays open: `account::GATE_OPEN`, and `owner_page::owner_shown`
-  never shows the sign-in sheet. Downloading the game from Mojang still needs an owner.
+  never shows the sign-in sheet. Downloading the game from Mojang needs no account (`backend::download_from_mojang`).
 - Offline skins and capes: the launcher passes `HORIZON_OFFLINE_SKIN`/`_MODEL` and
   `HORIZON_OFFLINE_CAPE` (`launcher/src/skins.rs`); the client reads them
   (`horizon-client-render/src/skins.rs`, `offline_skin`, `offline_cape`).

@@ -2,7 +2,7 @@
 //! sidebar's "Launcher x.y.z" reveal it for this run; it stays shown while one of its options is
 //! on. Its one option lets offline names play without an account that owns the game
 //! (`backend::Settings::dev_offline`). The game still comes from the player's own install: the
-//! launcher downloads Mojang's files only for an owner (`backend::download_for_owner`).
+//! launcher downloads Mojang's files without an owner (`backend::download_from_mojang`).
 use super::*;
 
 /// Clicks on the launcher's version that reveal the section.

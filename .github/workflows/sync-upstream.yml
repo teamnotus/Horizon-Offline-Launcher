@@ -1,0 +1,145 @@
+# Keep this fork current with Horizon's live repository. Every day (or on demand) the game's source,
+# manifests and lockfile are taken from upstream/main; this fork's launcher, release workflows,
+# install scripts, docs and signing key stay untouched. The result is tested before a PR is opened
+# and merged automatically. If a change breaks the launcher, the PR stays open with the failing
+# check instead of reaching players.
+name: sync upstream
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      HORIZON_LAUNCHER_NO_SELF_UPDATE: "1"
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            launcher
+      - name: Libraries GPUI links to
+        run: bash "$GITHUB_WORKSPACE/tools/ci/apt_install.sh" libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev libvulkan-dev libasound2-dev libudev-dev
+      - name: Take the game from upstream
+        id: sync
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/rdbtCVS/horizon.git || git remote set-url upstream https://github.com/rdbtCVS/horizon.git
+          git fetch --no-tags upstream main
+          git checkout -B sync/upstream origin/main
+          git checkout FETCH_HEAD -- .
+          # What this fork owns: the offline launcher, its releases and its identity.
+          rm -rf launcher .github packaging
+          git checkout origin/main -- launcher .github packaging
+          git checkout origin/main -- crates/horizon-release-sign/release-keys.txt \
+            README.md AGENTS.md install.ps1 install.sh build.ps1 native-hooks.json
+          # Upstream folded content mods into a new mod system; the offline launcher still uses
+          # this crate, so keep it and put it back in the workspace.
+          git checkout origin/main -- crates/horizon-mods
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('Cargo.toml')
+          s = p.read_text()
+          if '"crates/horizon-mods"' not in s:
+              s = s.replace('members = [\n', 'members = [\n    "crates/horizon-mods",\n', 1)
+          p.write_text(s)
+          PY
+          git add -A
+          if git diff --cached --quiet origin/main; then
+            echo "up_to_date=1" >> "$GITHUB_OUTPUT"
+            echo "Upstream is already here"
+            exit 0
+          fi
+          echo "up_to_date=0" >> "$GITHUB_OUTPUT"
+          echo "upstream=$(git rev-parse --short FETCH_HEAD)" >> "$GITHUB_OUTPUT"
+          git diff --cached --stat | tail -20
+      - name: The fork's offline guarantees survive the sync
+        if: steps.sync.outputs.up_to_date == '0'
+        run: |
+          set -euo pipefail
+          grep -q 'teamnotus/Horizon-Offline-Launcher' launcher/src/backend.rs
+          grep -q 'fn download_from_mojang' launcher/src/backend.rs
+          ! grep -q 'download_for_owner' launcher/src/backend.rs
+          grep -q 'MogBSp7EXM7IvkdnlwA5lwGb1HEu3uHTm4cHQHcnQEk=' crates/horizon-release-sign/release-keys.txt
+          test -f .github/workflows/game.yml
+      - name: Rebuild the exporter classes when the pinned game files change
+        if: steps.sync.outputs.up_to_date == '0'
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/exporters"
+          mkdir -p "$work/home/versions/local/crates/horizon-prepare" \
+                   "$work/home/versions/local/mods/horizon/src/test/java/dev/horizonlab/parity" \
+                   "$work/game" "$work/xdg-data" "$work/xdg-config"
+          cp research-lock.json "$work/home/versions/local/"
+          cp -r crates/horizon-prepare/. "$work/home/versions/local/crates/horizon-prepare/"
+          cp -r mods/horizon/src/test/java/dev/horizonlab/parity/. \
+                "$work/home/versions/local/mods/horizon/src/test/java/dev/horizonlab/parity/"
+          touch "$work/home/versions/local/.installed"
+          cargo build --release --manifest-path launcher/Cargo.toml -p horizon-launcher --bin horizon-launcher
+          HORIZON_LAUNCHER_HOME="$work/home" HORIZON_LAUNCHER_NO_SELF_UPDATE=1 HORIZON_HOME="$work/game" \
+          XDG_DATA_HOME="$work/xdg-data" XDG_CONFIG_HOME="$work/xdg-config" \
+            launcher/target/release/horizon-launcher prepare --download --version local
+          key=$(python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          root = Path('.')
+          h = hashlib.sha256()
+          h.update(b'exporters-v1 --release -proc:none -encoding UTF-8')
+          h.update((root / 'crates/horizon-prepare/src/exporters.rs').read_bytes().replace(b'\r', b''))
+          srcs = sorted(p for p in (root / 'mods/horizon/src/test/java/dev/horizonlab/parity').rglob('*.java'))
+          srcs.append(root / 'research-lock.json')
+          for p in srcs:
+              data = p.read_bytes().replace(b'\r', b'')
+              h.update(f'{p.relative_to(root).as_posix()}\0{len(data)}\0'.encode())
+              h.update(data)
+          print(h.hexdigest())
+          PY
+          )
+          bundle="$work/home/versions/local/.local/exporters/$key"
+          test -f "$bundle/manifest.json"
+          rm -f "$bundle"/*.log
+          tar -czf exporters.tar.gz -C "$bundle" manifest.json client server
+          git add exporters.tar.gz
+      - name: Build and test the result
+        if: steps.sync.outputs.up_to_date == '0'
+        run: |
+          set -euo pipefail
+          cargo check --workspace
+          (cd launcher && cargo test --release)
+          git add Cargo.lock launcher/Cargo.lock
+      - name: Push and open the PR
+        if: steps.sync.outputs.up_to_date == '0'
+        run: |
+          set -euo pipefail
+          git -c user.name='teamnotus' -c user.email='teamnotus@users.noreply.github.com' \
+            commit -m "sync: game source from rdbtCVS/horizon"
+          git push --force origin sync/upstream
+          body=$(cat <<EOF
+          Game source, manifests and lockfile from \`rdbtCVS/horizon@${{ steps.sync.outputs.upstream }}\`. The offline launcher, its release flows and its signing key stay this fork's. Merging publishes a new game Nightly and a new launcher release.
+          EOF
+          )
+          if gh pr view sync/upstream --json number > /dev/null 2>&1; then
+            gh pr edit sync/upstream --body "$body"
+          else
+            gh pr create --base main --head sync/upstream --title "sync: game source from upstream" --body "$body"
+          fi
+          gh pr merge sync/upstream --auto --squash || echo "::warning::Auto-merge is not enabled; the PR is open for review"

@@ -28,7 +28,7 @@ pub const NOT_CONFIGURED: &str =
 
 /// This fork plays without an account that owns the game: the owner gate stays open, as if the
 /// hidden developer option (`offline_without_owner`) were always on. Downloading the game from
-/// Mojang still needs an owner (`backend::download_for_owner`).
+/// Mojang needs no owner (`backend::download_from_mojang`).
 pub const GATE_OPEN: bool = true;
 /// What every Play says while no account in the launcher owns the game.
 pub const NEEDS_OWNER: &str =
@@ -1946,7 +1946,7 @@ pub fn launch(
 /// The owner gate before the game starts. With the window's hidden developer option
 /// (`backend::Settings::dev_offline`, `offline_without_owner`) no owner is no refusal: the game
 /// starts offline, without a session and without an `owner`. Downloads never come through here:
-/// `backend::download_for_owner` asks [`launch`] itself, so the option never downloads the game.
+/// `backend::download_from_mojang` needs no account, so the option never gates a download.
 pub fn launch_for_game(
     ep: &Endpoints,
     client_id: Option<&str>,

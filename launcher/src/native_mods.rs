@@ -1323,7 +1323,7 @@ pub fn revision_of(version: &str) -> Result<String, String> {
 /// `ask` on this fork's repository, else on Horizon's: the fork has no shared history with
 /// Horizon, so the commits mods are made for are often only there.
 fn either_repo<T>(ask: impl Fn(&str) -> Result<T, String>) -> Result<T, String> {
-    ask(backend::REPO).or_else(|_| ask(backend::UPSTREAM_REPO))
+    ask(backend::REPO).or_else(|_| ask(backend::GAME_SOURCE_REPO))
 }
 
 /// What a native build was made from: its `native-mods.json`.

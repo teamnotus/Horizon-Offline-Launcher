@@ -1,73 +1,31 @@
-# The game, as the launcher installs it. Horizon ships only Nightlies now (docs/release-flow.md), and
-# so does this fork: a run builds this fork's horizon-client for Linux, Windows (x64 and ARM64) and
-# macOS (Apple Silicon and Intel) and puts it into Horizon's own Nightly files (their exporters, horizon-prepare
-# and the rest are built from Mojang's jars on Horizon's private runner), then signs the checksums
-# for the nightly channel (SHA256SUMS.sig) and for this build's own version (SHA256SUMS.v2.sig,
-# nightly-<date>-<commit>, which current launchers require) and publishes them as this repository's `nightly` pre-release, titled
-# "Nightly <date> · <this fork's commit>". The one before stays a week as nightly-<its date>.
-# The launcher's own release stays GitHub's "latest", where install.ps1 and install.sh download
-# from.
+# The game, built from this fork's source and published as the `nightly` pre-release. Upstream
+# changes reach main through sync-upstream.yml; this builds them into the game client players get.
+# No private runner and no third-party nightly files: the launcher downloads and verifies Mojang's
+# game files itself. Each archive carries this fork's programs, research-lock.json and the
+# preparer's Java sources, so a fresh install can prepare 26.3 without another launcher or account.
+# The checksums are signed with this fork's key for both the channel (`nightly`) and the build's
+# own version.
 name: game
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
-    inputs:
-      upstream:
-        description: Horizon's release whose files the client goes into (nightly = Horizon's current Nightly)
-        default: nightly
-        required: true
 
 permissions:
   contents: read
 
 concurrency:
   group: game-nightly
+  cancel-in-progress: true
 
 env:
-  UPSTREAM: ${{ inputs.upstream }}
   HORIZON_TELEMETRY_URL: "off"
+  HORIZON_LAUNCHER_NO_SELF_UPDATE: "1"
 
 jobs:
-  pick:
-    runs-on: ubuntu-latest
-    outputs:
-      date: ${{ steps.pick.outputs.date }}
-      short: ${{ steps.pick.outputs.short }}
-      upstream_name: ${{ steps.pick.outputs.upstream_name }}
-    steps:
-      - id: pick
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          name=$(gh api "repos/horizon-rust/horizon/releases/tags/$UPSTREAM" --jq .name)
-          echo "Horizon's $UPSTREAM: $name"
-          # Every platform takes the files of this one Nightly, even if Horizon publishes the next
-          # while the clients build.
-          mkdir upstream
-          for asset in horizon-linux-x86_64.tar.gz horizon-windows-x64.zip horizon-macos-arm64.zip \
-                       horizon-macos-x64.zip horizon-server-linux-x86_64.tar.gz; do
-            gh release download "$UPSTREAM" -R horizon-rust/horizon -D upstream -p "$asset"
-          done
-          # Windows ARM64: only when Horizon's Nightly has it (its build may fail there too).
-          gh release download "$UPSTREAM" -R horizon-rust/horizon -D upstream -p horizon-windows-arm64.zip \
-            || echo "::warning::Horizon's $UPSTREAM has no horizon-windows-arm64.zip: this Nightly goes out without it"
-          [[ "$(gh api "repos/horizon-rust/horizon/releases/tags/$UPSTREAM" --jq .name)" == "$name" ]] \
-            || { echo "::error::Horizon's $UPSTREAM changed while downloading; run again"; exit 1; }
-          {
-            echo "date=$(date -u +%F)"
-            echo "short=${GITHUB_SHA:0:7}"
-            echo "upstream_name=$name"
-          } >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: upstream
-          path: upstream/*
-          retention-days: 3
-
   build:
     name: build ${{ matrix.name }}
-    needs: pick
     strategy:
       fail-fast: false
       matrix:
@@ -75,42 +33,33 @@ jobs:
           - name: linux
             os: ubuntu-22.04
             asset: horizon-linux-x86_64.tar.gz
-            client: horizon-client
-            # Horizon's server build, unchanged: packaging/server/install.sh installs it on Linux.
-            server_asset: horizon-server-linux-x86_64.tar.gz
+            suffix: ""
           - name: windows
             os: windows-latest
             asset: horizon-windows-x64.zip
-            client: horizon-client.exe
-            # The C runtime linked in, so the game runs without the Visual C++ redistributable.
+            suffix: .exe
             rustflags: -C target-feature=+crt-static
-          # Windows on ARM: the same runner, another target. Optional: without it, ARM64 launchers
-          # install the x64 build.
           - name: windows-arm64
             os: windows-latest
             target: aarch64-pc-windows-msvc
             asset: horizon-windows-arm64.zip
-            client: horizon-client.exe
+            suffix: .exe
             rustflags: -C target-feature=+crt-static
             optional: true
           - name: macos
             os: macos-15
             asset: horizon-macos-arm64.zip
-            client: horizon-client
-          # Intel Macs: the same runner, another target.
+            suffix: ""
           - name: macos-x64
             os: macos-15
             target: x86_64-apple-darwin
             asset: horizon-macos-x64.zip
-            client: horizon-client
+            suffix: ""
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.optional == true }}
     timeout-minutes: 180
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
-      # What the game says it is (--version, crash reports) and shows: as Horizon's Nightlies.
-      HORIZON_VERSION: nightly-${{ needs.pick.outputs.date }}
-      HORIZON_NIGHTLY: ${{ needs.pick.outputs.date }} ${{ needs.pick.outputs.short }}
     defaults:
       run:
         shell: bash
@@ -127,58 +76,51 @@ jobs:
       - name: ALSA and udev headers
         if: runner.os == 'Linux'
         run: bash "$GITHUB_WORKSPACE/tools/ci/apt_install.sh" libasound2-dev libudev-dev
-      - name: Build the client
-        run: |
-          target=(); [[ -n "${{ matrix.target }}" ]] && target=(--target "${{ matrix.target }}")
-          cargo build --release --locked -p horizon-client --bin horizon-client "${target[@]}"
-          out=target/release; [[ -n "${{ matrix.target }}" ]] && out="target/${{ matrix.target }}/release"
-          echo "CLIENT=$out/${{ matrix.client }}" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
-        with:
-          name: upstream
-          path: horizon-files
-      - name: Horizon's files of that Nightly
-        run: |
-          mkdir -p upstream dist
-          [[ -f "horizon-files/${{ matrix.asset }}" ]] \
-            || { echo "::error::Horizon's Nightly has no ${{ matrix.asset }}"; exit 1; }
-          mv "horizon-files/${{ matrix.asset }}" upstream/
-          if [[ -n "${{ matrix.server_asset }}" ]]; then
-            mv "horizon-files/${{ matrix.server_asset }}" dist/
-          fi
-          rm -rf horizon-files
-      - name: Put this fork's client in them
+      - name: Build the game's programs
         run: |
           set -euo pipefail
-          cd upstream
+          target=(); [[ -n "${{ matrix.target }}" ]] && target=(--target "${{ matrix.target }}")
+          cargo build --release --locked "${target[@]}" \
+            -p horizon-client --bin horizon-client \
+            -p horizon-client-lib --bin horizon-ctl \
+            -p horizon-prepare --bin horizon-prepare \
+            -p horizon-server --bin horizon-server
+          out=target/release; [[ -n "${{ matrix.target }}" ]] && out="target/${{ matrix.target }}/release"
+          mkdir -p dist/horizon
+          for program in horizon-client horizon-ctl horizon-prepare horizon-server; do
+            cp "$out/$program${{ matrix.suffix }}" "dist/horizon/$program${{ matrix.suffix }}"
+            chmod +x "dist/horizon/$program${{ matrix.suffix }}"
+          done
+          # The launcher reads these from its installed version to pin Mojang's files and to
+          # compile the vanilla exporters when the archive has no precompiled bundle.
+          cp research-lock.json LICENSE dist/horizon/
+          mkdir -p dist/horizon/crates/horizon-prepare \
+                   dist/horizon/mods/horizon/src/test/java/dev/horizonlab/parity
+          cp -r crates/horizon-prepare/. dist/horizon/crates/horizon-prepare/
+          cp -r mods/horizon/src/test/java/dev/horizonlab/parity/. \
+                dist/horizon/mods/horizon/src/test/java/dev/horizonlab/parity/
+          # The exporter classes compiled from those sources against the pinned jars: without
+          # them a player would need a JDK installed. Stored as one archive, never loose .class.
+          mkdir -p dist/horizon/exporters
+          tar -xzf exporters.tar.gz -C dist/horizon/exporters
+          # What the game reports as its version; the release's own version is in the tag.
+          echo "HORIZON_VERSION=nightly-$(date -u +%F)-${GITHUB_SHA:0:7}" >> "$GITHUB_ENV"
+          cd dist
           case "${{ matrix.asset }}" in
-            *.tar.gz) tar -xzf "${{ matrix.asset }}" ;;
-            *) unzip -q "${{ matrix.asset }}" ;;
+            *.tar.gz) tar -czf "${{ matrix.asset }}" horizon ;;
+            *.zip) if [[ "$RUNNER_OS" == Windows ]]; then 7z a -tzip "${{ matrix.asset }}" horizon > /dev/null
+                   else ditto -c -k --norsrc --noextattr --noqtn --keepParent horizon "${{ matrix.asset }}"; fi ;;
           esac
-          rm "${{ matrix.asset }}"
-          found=$(find . -type f -name "${{ matrix.client }}" | head -1)
-          [[ -n "$found" ]] || { echo "::error::Horizon's ${{ matrix.asset }} has no ${{ matrix.client }}"; exit 1; }
-          cp "../$CLIENT" "$found"
-          chmod +x "$found"
-          # Horizon's Developer ID signature belonged to its own binary: sign this one ad hoc, as
-          # Apple Silicon runs nothing unsigned.
-          if [[ "$RUNNER_OS" == macOS ]]; then codesign --force --sign - "$found"; fi
-          top=$(dirname "$found" | cut -d/ -f2)
-          case "${{ matrix.asset }}" in
-            *.tar.gz) tar -czf "../dist/${{ matrix.asset }}" "$top" ;;
-            *) if [[ "$RUNNER_OS" == Windows ]]; then 7z a -tzip "../dist/${{ matrix.asset }}" "$top" > /dev/null
-               else ditto -c -k --norsrc --noextattr --noqtn --keepParent "$top" "../dist/${{ matrix.asset }}"; fi ;;
-          esac
-          ls -l ../dist
+          rm -rf horizon
+          ls -l
       - uses: actions/upload-artifact@v4
         with:
           name: game-${{ matrix.name }}
-          path: dist/*
+          path: dist/${{ matrix.asset }}
 
   release:
-    needs: [pick, build]
-    # The ARM64 build is optional: the release goes out with whatever was built.
-    if: ${{ !cancelled() && needs.pick.result == 'success' }}
+    needs: build
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -191,55 +133,56 @@ jobs:
           path: dist
           pattern: game-*
           merge-multiple: true
-      - name: Sign the checksums for the nightly channel (SHA256SUMS.sig) and for this build (SHA256SUMS.v2.sig)
+      - name: Nightly version
+        id: nightly
+        run: |
+          echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+          echo "short=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+      - name: Sign the checksums (SHA256SUMS.sig and SHA256SUMS.v2.sig)
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
-          ALSO_FOR: nightly-${{ needs.pick.outputs.date }}-${{ needs.pick.outputs.short }}
+          ALSO_FOR: nightly-${{ steps.nightly.outputs.date }}-${{ steps.nightly.outputs.short }}
         run: |
           [[ -n "$RELEASE_SIGNING_KEY" ]] || { echo "::error::The RELEASE_SIGNING_KEY secret is not set"; exit 1; }
           for required in horizon-linux-x86_64.tar.gz horizon-windows-x64.zip horizon-macos-arm64.zip \
-                          horizon-macos-x64.zip horizon-server-linux-x86_64.tar.gz; do
+                          horizon-macos-x64.zip; do
             [[ -f "dist/$required" ]] || { echo "::error::dist/$required was not built"; exit 1; }
           done
           arm64=(); if [[ -f dist/horizon-windows-arm64.zip ]]; then arm64=(dist/horizon-windows-arm64.zip)
-          else echo "::warning::horizon-windows-arm64.zip is missing: SHA256SUMS goes out without it"; fi
+          else echo "::warning::horizon-windows-arm64.zip is missing; Windows ARM64 falls back to x64"; fi
           bash tools/ci/sign_release.sh nightly dist/horizon-linux-x86_64.tar.gz dist/horizon-windows-x64.zip \
-            "${arm64[@]}" dist/horizon-macos-arm64.zip dist/horizon-macos-x64.zip dist/horizon-server-linux-x86_64.tar.gz
+            "${arm64[@]}" dist/horizon-macos-arm64.zip dist/horizon-macos-x64.zip
       - uses: dtolnay/rust-toolchain@stable
       - name: The signatures, checked as launchers check them
         env:
-          DATE: ${{ needs.pick.outputs.date }}
-          SHORT: ${{ needs.pick.outputs.short }}
+          DATE: ${{ steps.nightly.outputs.date }}
+          SHORT: ${{ steps.nightly.outputs.short }}
         run: |
           cargo run --locked --quiet -p horizon-release-sign -- verify --tag nightly --publishing dist
-          # The version's own signature, which current launchers require: the title below names it.
           cargo run --locked --quiet -p horizon-release-sign -- verify --tag "nightly-${DATE}-${SHORT}" \
             --signature SHA256SUMS.v2.sig --publishing dist
       - name: Publish as the `nightly` pre-release
         env:
           GH_TOKEN: ${{ github.token }}
-          DATE: ${{ needs.pick.outputs.date }}
-          SHORT: ${{ needs.pick.outputs.short }}
-          UPSTREAM_NAME: ${{ needs.pick.outputs.upstream_name }}
+          DATE: ${{ steps.nightly.outputs.date }}
+          SHORT: ${{ steps.nightly.outputs.short }}
         run: |
           set -euo pipefail
           cat > notes.md <<EOF
-          This fork's game client (commit $SHORT) in Horizon's own files of $UPSTREAM_NAME.
-          Horizon Offline Launcher installs it by itself; there is nothing to download here by hand.
+          Nightly $DATE · $SHORT, built from this fork's source. The launcher installs it by itself;
+          Minecraft 26.3 is downloaded from Mojang on first use, without another launcher or account.
           EOF
           python3 tools/ci/nightly.py rotate
           arm64=()
           if [[ -f dist/horizon-windows-arm64.zip ]]; then
-            arm64=("dist/horizon-windows-arm64.zip#Game files the launcher installs: Windows ARM64 (horizon-windows-arm64.zip)")
+            arm64=("dist/horizon-windows-arm64.zip#Game client: Windows ARM64 (horizon-windows-arm64.zip)")
           fi
-          # A pre-release, never GitHub's latest: the latest stays the launcher's own release.
           gh release create nightly --prerelease --latest=false --target "$GITHUB_SHA" \
             --title "Nightly $DATE · $SHORT" --notes-file notes.md \
-            "dist/horizon-linux-x86_64.tar.gz#Game files the launcher installs: Linux (horizon-linux-x86_64.tar.gz)" \
-            "dist/horizon-windows-x64.zip#Game files the launcher installs: Windows (horizon-windows-x64.zip)" \
+            "dist/horizon-linux-x86_64.tar.gz#Game client: Linux (horizon-linux-x86_64.tar.gz)" \
+            "dist/horizon-windows-x64.zip#Game client: Windows x64 (horizon-windows-x64.zip)" \
             "${arm64[@]}" \
-            "dist/horizon-macos-arm64.zip#Game files the launcher installs: macOS on Apple Silicon (horizon-macos-arm64.zip)" \
-            "dist/horizon-macos-x64.zip#Game files the launcher installs: macOS on Intel (horizon-macos-x64.zip)" \
-            "dist/horizon-server-linux-x86_64.tar.gz#Horizon's dedicated server for Linux (horizon-server-linux-x86_64.tar.gz)" \
+            "dist/horizon-macos-arm64.zip#Game client: macOS on Apple Silicon (horizon-macos-arm64.zip)" \
+            "dist/horizon-macos-x64.zip#Game client: macOS on Intel (horizon-macos-x64.zip)" \
             dist/SHA256SUMS dist/SHA256SUMS.sig dist/SHA256SUMS.v2.sig
           python3 tools/ci/nightly.py prune --days 7

@@ -62,7 +62,7 @@ Prepare a version's resources from your own Minecraft install, or from Mojang.
     horizon-launcher prepare
 
 - `--minecraft`: The game folder of the official launcher, Prism Launcher, MultiMC, the Modrinth App, ATLauncher or GDLauncher, or a Minecraft client jar file itself (default: the jar or folder chosen in the launcher, then every launcher's default)
-- `--download`: Download Minecraft from Mojang for the signed-in account that owns it, instead of using an install
+- `--download`: Download Minecraft from Mojang automatically, without an account, instead of using an install
 
 MCP: `prepare`.
 

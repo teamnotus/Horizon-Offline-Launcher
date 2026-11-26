@@ -351,6 +351,24 @@ pub fn not_found(version: &str, checked: &[(PathBuf, String)], chosen: &Path) ->
 /// Fetches a URL's body (from several threads for a download).
 pub type Fetch<'a> = &'a (dyn Fn(&str) -> Result<Vec<u8>, String> + Sync);
 
+/// The Prism Launcher or MultiMC root that owns `path`, when it is one: either the root itself
+/// (with its shared `libraries` and `instances`) or one of its instances (`mmc-pack.json`). The
+/// root is what `horizon-prepare --prism-dir` reads to resolve patched library versions.
+pub fn prism_root_of(path: &Path) -> Option<PathBuf> {
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    for dir in path.ancestors() {
+        if dir.join("libraries").is_dir() && dir.join("instances").is_dir() {
+            return Some(dir.to_path_buf());
+        }
+        if dir.join("mmc-pack.json").is_file() || dir.join("instance.cfg").is_file() {
+            if let Some(root) = dir.ancestors().find(|a| a.join("instances").is_dir()) {
+                return Some(root.to_path_buf());
+            }
+        }
+    }
+    None
+}
+
 /// Where the pinned version is.
 #[derive(Debug, PartialEq)]
 pub enum Resolved {

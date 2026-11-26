@@ -300,6 +300,25 @@ fn prism_native_jars_are_found_through_the_linked_folder() {
 }
 
 #[test]
+fn prism_root_is_found_from_an_instance_or_a_library() {
+    let s = Scratch::new("prism-root");
+    let root = s.0.join("PrismLauncher");
+    fs::create_dir_all(root.join("instances/One/.minecraft")).unwrap();
+    fs::create_dir_all(root.join("libraries")).unwrap();
+    s.write("PrismLauncher/instances/One/mmc-pack.json", b"{}");
+    let jar = s.write(
+        "PrismLauncher/libraries/com/mojang/minecraft/26.3/minecraft-26.3-client.jar",
+        CLIENT,
+    );
+    assert_eq!(prism_root_of(&jar), Some(root.clone()));
+    assert_eq!(
+        prism_root_of(&root.join("instances/One")),
+        Some(root.clone())
+    );
+    assert_eq!(prism_root_of(&s.0), None);
+}
+
+#[test]
 fn a_main_jar_elsewhere_is_found_from_the_metadata() {
     let s = Scratch::new("meta-jar");
     let dir = s.launcher(

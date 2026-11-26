@@ -734,7 +734,7 @@ enum Cmd {
         /// folder chosen in the launcher, then every launcher's default)
         #[arg(long, conflicts_with = "download")]
         minecraft: Option<PathBuf>,
-        /// Download Minecraft from Mojang for the signed-in account that owns it, instead of
+        /// Download Minecraft from Mojang automatically, without an account, instead of
         /// using an install
         #[arg(long)]
         download: bool,

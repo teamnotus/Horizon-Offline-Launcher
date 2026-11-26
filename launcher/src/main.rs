@@ -5985,9 +5985,8 @@ mod tests {
         );
     }
 
-    /// An owner's Play works on a version not prepared yet: it prepares it (downloading
-    /// Minecraft from Mojang when this computer has no install), then plays. Without an owner
-    /// it stays off: signing in comes first.
+    /// Play works on a version not prepared yet: it prepares it (downloading Minecraft from
+    /// Mojang when this computer has no install), then plays offline.
     #[test]
     fn play_prepares_first_for_an_owner() {
         use super::{play_press, PlayPress};

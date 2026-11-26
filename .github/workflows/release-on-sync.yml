@@ -1,0 +1,41 @@
+# A merged upstream sync ships: tag the launcher so launcher.yml builds, signs and publishes a new
+# release, and game.yml publishes the new game Nightly from the same commit.
+name: release on sync
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tag:
+    if: ${{ github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'sync/upstream' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tag the next launcher release
+        run: |
+          set -euo pipefail
+          latest=$(git tag -l 'launcher@*' --sort=-v:refname | head -1 || true)
+          if [[ -z "$latest" ]]; then
+            next=1.5.0
+          else
+            version=${latest#launcher@}
+            major=${version%%.*}; rest=${version#*.}
+            minor=${rest%%.*}; patch=${rest#*.}
+            next="$major.$minor.$((patch + 1))"
+          fi
+          if git rev-parse -q --verify "refs/tags/launcher@$next" > /dev/null; then
+            echo "launcher@$next already exists"
+            exit 0
+          fi
+          git -c user.name='teamnotus' -c user.email='teamnotus@users.noreply.github.com' \
+            tag "launcher@$next"
+          git push origin "launcher@$next"

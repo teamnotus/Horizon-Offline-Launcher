@@ -1,11 +1,11 @@
 <h1 align="center">Horizon Offline Launcher</h1>
 
 <p align="center">
-  <b>A launcher for <a href="https://github.com/horizon-rust/horizon">Horizon</a> (Minecraft: Java Edition 26.3 rewritten in Rust) that plays without a Microsoft account and lets you pick your own jar.</b>
+  <b>A launcher for <a href="https://github.com/rdbtCVS/horizon">Horizon</a> (Minecraft: Java Edition 26.3 rewritten in Rust) that plays without a Microsoft account and lets you pick your own jar.</b>
 </p>
 
 <p align="center">
-  <a href="https://github.com/gerdaroot/Horizon-Offline-Launcher/releases/latest/download/Horizon-Offline-Launcher-Setup.exe"><b>Download for Windows</b></a> ·
+  <a href="https://github.com/teamnotus/Horizon-Offline-Launcher/releases/latest/download/Horizon-Offline-Launcher-Setup.exe"><b>Download for Windows</b></a> ·
   <a href="#install">Install</a> ·
   <a href="#first-run">First run</a> ·
   <a href="#faq">FAQ</a> ·
@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/gerdaroot/Horizon-Offline-Launcher/actions/workflows/launcher.yml"><img src="https://github.com/gerdaroot/Horizon-Offline-Launcher/actions/workflows/launcher.yml/badge.svg" alt="Build"></a>
+  <a href="https://github.com/teamnotus/Horizon-Offline-Launcher/actions/workflows/launcher.yml"><img src="https://github.com/teamnotus/Horizon-Offline-Launcher/actions/workflows/launcher.yml/badge.svg" alt="Build"></a>
   <img src="https://img.shields.io/badge/Minecraft-Java%2026.3-5D9C3F" alt="Minecraft Java 26.3">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-2A2470" alt="Windows, Linux, macOS">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-3B2F7E" alt="MIT"></a>
@@ -36,17 +36,17 @@
 
 Everything else works as in Horizon: mods, resource packs, instances, servers, playing with friends by invite code.
 
-> Unofficial. Not affiliated with Mojang, Microsoft or the Horizon authors. No Minecraft files are included: the game needs your own copy of Minecraft: Java Edition 26.3.
+> Unofficial. Not affiliated with Mojang, Microsoft or the Horizon authors. Minecraft 26.3 is downloaded and verified from Mojang on first run; no other launcher or account is needed.
 
 ## Install
 
 <p align="center">
-  <a href="https://github.com/gerdaroot/Horizon-Offline-Launcher/releases/latest/download/Horizon-Offline-Launcher-Setup.exe"><img src="https://img.shields.io/badge/Download%20for%20Windows-Setup.exe-6C4AE0?style=for-the-badge&logo=windows&logoColor=white" alt="Download for Windows"></a>
+  <a href="https://github.com/teamnotus/Horizon-Offline-Launcher/releases/latest/download/Horizon-Offline-Launcher-Setup.exe"><img src="https://img.shields.io/badge/Download%20for%20Windows-Setup.exe-6C4AE0?style=for-the-badge&logo=windows&logoColor=white" alt="Download for Windows"></a>
 </p>
 
 ### Windows
 
-1. **[Download `Horizon-Offline-Launcher-Setup.exe`](https://github.com/gerdaroot/Horizon-Offline-Launcher/releases/latest/download/Horizon-Offline-Launcher-Setup.exe)**.
+1. **[Download `Horizon-Offline-Launcher-Setup.exe`](https://github.com/teamnotus/Horizon-Offline-Launcher/releases/latest/download/Horizon-Offline-Launcher-Setup.exe)**.
 2. **Run it.** If Windows says "Windows protected your PC", click **More info → Run anyway** (the file just isn't code-signed).
 3. **Install → Finish.** The launcher opens by itself; its shortcuts are in the Start menu and, if you ticked it, on the desktop.
 
@@ -58,7 +58,7 @@ No administrator rights needed: it installs for your user only, in `%LOCALAPPDAT
 Win+X → Terminal, then:
 
 ```powershell
-irm https://github.com/gerdaroot/Horizon-Offline-Launcher/releases/latest/download/install.ps1 | iex
+irm https://github.com/teamnotus/Horizon-Offline-Launcher/releases/latest/download/install.ps1 | iex
 ```
 
 It puts the launcher in the same place, with the same shortcuts.
@@ -67,16 +67,16 @@ It puts the launcher in the same place, with the same shortcuts.
 ### Linux and macOS
 
 ```sh
-curl -fsSL https://github.com/gerdaroot/Horizon-Offline-Launcher/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/teamnotus/Horizon-Offline-Launcher/releases/latest/download/install.sh | sh
 ```
 
 Then start it with `horizon-offline-launcher`. On Linux it adds itself to the applications menu.
 
 ## First run
 
-1. **Have Minecraft 26.3.** If you don't yet, download and start version **26.3** once in any launcher (official, TLauncher, Prism…).
+1. **No Minecraft install needed.** Prepare downloads and verifies 26.3 from Mojang itself — no other launcher or Microsoft account.
 2. **Open Horizon Offline Launcher.** It downloads the latest Horizon by itself.
-3. **Press "Prepare"** on the Resources row. The launcher finds your `26.3.jar` and builds the textures and sounds from it: once, in a few minutes. If it can't find the jar, press **"Choose jar…"** and pick `26.3.jar`; it is usually in `.minecraft\versions\26.3\`.
+3. **Press "Prepare"** on the Resources row. The launcher downloads Minecraft 26.3 from Mojang and verifies every file, then builds the textures and sounds: once, in a few minutes. If you already have 26.3 in another launcher, it finds it and uses that instead; **"Choose jar…"** picks a specific jar.
 4. **Press "Play".**
 
 Your offline name is changed with the player button at the top right; its skin in Settings → Account.
@@ -93,7 +93,7 @@ Your offline name is changed with the player button at the top right; its skin i
 
 **Do resource packs work?** Yes, as in Horizon: Options → Resource Packs in the game, or the launcher's resource packs page.
 
-**Prepare says "Missing …\libraries\…" or "asks for an original Minecraft installation".** The jar alone isn't enough: the game also needs the libraries and sounds that come with it. Start version **26.3** once in your launcher (TLauncher, Prism, AstralRinth…) until the main menu, then press Prepare again with the jar on "Automatic". A jar you picked by hand takes those files from the launcher folder it is in, or from any launcher that has 26.3.
+**Prepare says "Missing …\libraries\…".** Press Prepare with "Automatic": the launcher downloads Minecraft 26.3 from Mojang, libraries and sounds included. A Prism install is read directly, including its patched LWJGL libraries.
 
 **The launcher doesn't open.** It leaves `launcher-crash.txt` in `%APPDATA%\horizon-launcher` and says what to do. "Creating DXGI factory" means Windows is older than Windows 10 version 1803: update Windows. "Creating DirectX renderer" means the graphics driver is old: the launcher retries without DirectComposition by itself, and if it still doesn't open, update the driver from Intel's, NVIDIA's or AMD's site.
 
@@ -106,7 +106,7 @@ Your offline name is changed with the player button at the top right; its skin i
 Windows (needs [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with "Desktop development with C++"):
 
 ```powershell
-git clone https://github.com/gerdaroot/Horizon-Offline-Launcher
+git clone https://github.com/teamnotus/Horizon-Offline-Launcher
 cd Horizon-Offline-Launcher
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
@@ -125,8 +125,8 @@ Linux needs `libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-de
 
 GitHub Actions builds Windows, Linux and macOS (Apple Silicon and Intel):
 
-- A `launcher@1.4.4` tag: the launcher, with the Windows installer and the install scripts. It becomes the repository's latest release.
-- The game, like Horizon, ships as Nightlies: running the `game` workflow puts this fork's client into Horizon's current Nightly files and publishes them as the `nightly` pre-release, "Nightly <date> · <commit>". The previous one stays a week as `nightly-<date>`.
+- A `launcher@1.5.0` tag: the launcher, with the Windows installer and the install scripts. It becomes the repository's latest release.
+- The game, like Horizon, ships as Nightlies: every push to main builds this fork's client from source (with the pinned game files and exporter classes) and publishes it as the `nightly` pre-release, "Nightly <date> · <commit>". The previous one stays a week as `nightly-<date>`.
 
 Both are signed with the repository's key (the `RELEASE_SIGNING_KEY` secret); launchers refuse anything else.
 
@@ -154,7 +154,7 @@ The game and nearly all of the code are [Horizon](https://github.com/horizon-rus
 **Horizon Offline Launcher** — лаунчер для [Horizon](https://github.com/horizon-rust/horizon) (Minecraft: Java Edition 26.3, переписанный на Rust) без обязательного аккаунта Microsoft и с выбором своего jar.
 
 <p>
-  <a href="https://github.com/gerdaroot/Horizon-Offline-Launcher/releases/latest/download/Horizon-Offline-Launcher-Setup.exe"><b>Скачать для Windows</b></a> ·
+  <a href="https://github.com/teamnotus/Horizon-Offline-Launcher/releases/latest/download/Horizon-Offline-Launcher-Setup.exe"><b>Скачать для Windows</b></a> ·
   <a href="#установка">Установка</a> ·
   <a href="#первый-запуск">Первый запуск</a> ·
   <a href="#вопросы">Вопросы</a> ·
@@ -174,17 +174,17 @@ The game and nearly all of the code are [Horizon](https://github.com/horizon-rus
 
 Всё остальное — как в Horizon: моды, ресурс-паки, сборки, серверы, игра с друзьями по коду.
 
-> Неофициальный проект, не связан с Mojang, Microsoft и авторами Horizon. Файлов Minecraft здесь нет: игре нужен ваш собственный Minecraft: Java Edition 26.3.
+> Неофициальный проект, не связан с Mojang, Microsoft и авторами Horizon. Minecraft 26.3 скачивается и проверяется из Mojang при первом запуске; другой лаунчер и аккаунт не нужны.
 
 ### Установка
 
 <p align="center">
-  <a href="https://github.com/gerdaroot/Horizon-Offline-Launcher/releases/latest/download/Horizon-Offline-Launcher-Setup.exe"><img src="https://img.shields.io/badge/%D0%A1%D0%BA%D0%B0%D1%87%D0%B0%D1%82%D1%8C%20%D0%B4%D0%BB%D1%8F%20Windows-Setup.exe-6C4AE0?style=for-the-badge&logo=windows&logoColor=white" alt="Скачать для Windows"></a>
+  <a href="https://github.com/teamnotus/Horizon-Offline-Launcher/releases/latest/download/Horizon-Offline-Launcher-Setup.exe"><img src="https://img.shields.io/badge/%D0%A1%D0%BA%D0%B0%D1%87%D0%B0%D1%82%D1%8C%20%D0%B4%D0%BB%D1%8F%20Windows-Setup.exe-6C4AE0?style=for-the-badge&logo=windows&logoColor=white" alt="Скачать для Windows"></a>
 </p>
 
 **Windows**
 
-1. **[Скачайте `Horizon-Offline-Launcher-Setup.exe`](https://github.com/gerdaroot/Horizon-Offline-Launcher/releases/latest/download/Horizon-Offline-Launcher-Setup.exe)**.
+1. **[Скачайте `Horizon-Offline-Launcher-Setup.exe`](https://github.com/teamnotus/Horizon-Offline-Launcher/releases/latest/download/Horizon-Offline-Launcher-Setup.exe)**.
 2. **Запустите его.** Если Windows покажет «Windows защитила ваш компьютер», нажмите **«Подробнее» → «Выполнить в любом случае»** (файл просто не подписан сертификатом).
 3. **«Установить» → «Завершить».** Лаунчер откроется сам; ярлыки — в меню «Пуск» и, если отметили галочку, на рабочем столе.
 
@@ -196,7 +196,7 @@ The game and nearly all of the code are [Horizon](https://github.com/horizon-rus
 Win+X → «Терминал», затем:
 
 ```powershell
-irm https://github.com/gerdaroot/Horizon-Offline-Launcher/releases/latest/download/install.ps1 | iex
+irm https://github.com/teamnotus/Horizon-Offline-Launcher/releases/latest/download/install.ps1 | iex
 ```
 
 Лаунчер встанет в то же место, с теми же ярлыками.
@@ -205,16 +205,16 @@ irm https://github.com/gerdaroot/Horizon-Offline-Launcher/releases/latest/downlo
 **Linux и macOS:**
 
 ```sh
-curl -fsSL https://github.com/gerdaroot/Horizon-Offline-Launcher/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/teamnotus/Horizon-Offline-Launcher/releases/latest/download/install.sh | sh
 ```
 
 После установки лаунчер запускается командой `horizon-offline-launcher`. На Linux он сам добавит себя в меню приложений.
 
 ### Первый запуск
 
-1. **Нужен Minecraft 26.3.** Если его ещё нет, скачайте и один раз запустите версию **26.3** в любом лаунчере (официальном, TLauncher, Prism и т. д.).
+1. **Minecraft 26.3 не нужен заранее.** При подготовке лаунчер сам скачает и проверит его из Mojang — без другого лаунчера и аккаунта.
 2. **Откройте Horizon Offline Launcher.** Он сам скачает последнюю версию Horizon.
-3. **Нажмите «Подготовить»** в строке «Ресурсы». Лаунчер найдёт ваш `26.3.jar` и соберёт из него текстуры и звуки. Это делается один раз и занимает несколько минут. Если jar не нашёлся, нажмите **«Выбрать jar…»** и укажите файл `26.3.jar`; обычно он лежит в `.minecraft\versions\26.3\`.
+3. **Нажмите «Подготовить»** в строке «Ресурсы». Лаунчер скачает Minecraft 26.3 из Mojang, проверит каждый файл и соберёт текстуры со звуками. Это делается один раз и занимает несколько минут. Если 26.3 уже есть в другом лаунчере, он найдёт его; **«Выбрать jar…»** задаёт конкретный jar.
 4. **Нажмите «Играть».**
 
 Ник для офлайн-игры меняется вверху справа, кнопкой с именем игрока, а его скин — в «Настройки → Аккаунт».
@@ -231,7 +231,7 @@ curl -fsSL https://github.com/gerdaroot/Horizon-Offline-Launcher/releases/latest
 
 **Ресурс-паки работают?** Да, как в Horizon: «Настройки → Пакеты ресурсов» в игре или страница ресурс-паков в лаунчере.
 
-**Prepare пишет «Missing …\libraries\…» или «нужна оригинальная установка Minecraft».** Одного jar мало: игре нужны ещё библиотеки и звуки, которые лаунчер скачивает вместе с ним. Один раз запустите версию **26.3** в своём лаунчере (TLauncher, Prism, AstralRinth…) до главного меню, потом снова нажмите Prepare с jar на «Автоматически». Выбранный вручную jar берёт эти файлы из папки лаунчера, где он лежит, или из любого лаунчера, где есть 26.3.
+**Prepare пишет «Missing …\libraries\…».** Нажмите Prepare с режимом «Автоматически»: лаунчер скачает Minecraft 26.3 из Mojang вместе с библиотеками и звуками. Установка Prism читается напрямую, включая пропатченные библиотеки LWJGL.
 
 **Лаунчер не открывается.** Он оставляет `launcher-crash.txt` в `%APPDATA%\horizon-launcher` и пишет, что делать. «Creating DXGI factory» — Windows старше Windows 10 версии 1803: обновите Windows. «Creating DirectX renderer» — старый драйвер видеокарты: лаунчер сам пробует ещё раз без DirectComposition, а если всё равно не открылся, обновите драйвер с сайта Intel, NVIDIA или AMD.
 
@@ -244,7 +244,7 @@ curl -fsSL https://github.com/gerdaroot/Horizon-Offline-Launcher/releases/latest
 Windows (нужны [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) с «Разработкой классических приложений на C++»):
 
 ```powershell
-git clone https://github.com/gerdaroot/Horizon-Offline-Launcher
+git clone https://github.com/teamnotus/Horizon-Offline-Launcher
 cd Horizon-Offline-Launcher
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
@@ -263,8 +263,8 @@ cargo build --release
 
 GitHub Actions собирает Windows, Linux и macOS (Apple Silicon и Intel):
 
-- Тег `launcher@1.4.4` — лаунчер, с установщиком для Windows и скриптами установки. Становится последним релизом репозитория.
-- Игра, как и у Horizon, выходит Nightly-сборками: запуск workflow `game` кладёт клиент этого форка в файлы текущего Nightly Horizon и публикует их пре-релизом `nightly`, «Nightly <дата> · <коммит>». Предыдущий хранится неделю как `nightly-<дата>`.
+- Тег `launcher@1.5.0` — лаунчер, с установщиком для Windows и скриптами установки. Становится последним релизом репозитория.
+- Игра, как и у Horizon, выходит Nightly-сборками: каждый push в main собирает клиент этого форка из исходников (с закреплёнными файлами игры и классами экспортеров) и публикует его пре-релизом `nightly`, «Nightly <дата> · <коммит>». Предыдущий хранится неделю как `nightly-<дата>`.
 
 Оба подписываются ключом репозитория (секрет `RELEASE_SIGNING_KEY`), всё остальное лаунчеры отвергают.
 
