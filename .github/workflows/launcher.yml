@@ -141,6 +141,8 @@ jobs:
         run: |
           [[ -n "$RELEASE_SIGNING_KEY" ]] || { echo "::error::The RELEASE_SIGNING_KEY secret is not set"; exit 1; }
           bash tools/ci/sign_release.sh "$GITHUB_REF_NAME" dist/*
+      - name: Libraries GPUI links to, for the tar.gz smoke test
+        run: bash tools/ci/apt_install.sh libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev libvulkan-dev libasound2-dev
       - name: The Linux binaries start and say this release's version
         run: |
           set -euo pipefail
