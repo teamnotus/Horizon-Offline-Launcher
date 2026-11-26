@@ -83,7 +83,7 @@ jobs:
           target_args=""
           if [[ -n "${{ matrix.target }}" ]]; then target_args="--target ${{ matrix.target }}"; fi
           cargo build --release --locked $target_args \
-            -p horizon-client --bin horizon-client \
+            -p horizon-game --bin horizon-client \
             -p horizon-client-lib --bin horizon-ctl \
             -p horizon-prepare --bin horizon-prepare \
             -p horizon-server --bin horizon-server

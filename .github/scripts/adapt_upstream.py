@@ -11,7 +11,6 @@ from pathlib import Path
 
 ROOT = Path.cwd()
 API = ROOT / "launcher/src/native_mods/api.rs"
-GAME_WORKFLOW = ROOT / ".github/workflows/game.yml"
 
 
 def replace_once(text: str, old: str, new: str, what: str) -> str:
@@ -168,14 +167,6 @@ fn main() {{
     source = replace_once(source, old, new, "api.rs allocator test")
     API.write_text(source)
 
-    workflow = GAME_WORKFLOW.read_text()
-    workflow = replace_once(
-        workflow,
-        "-p horizon-client --bin horizon-client",
-        "-p horizon-game --bin horizon-client",
-        "game workflow's executable",
-    )
-    GAME_WORKFLOW.write_text(workflow)
 
 
 if __name__ == "__main__":
