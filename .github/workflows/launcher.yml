@@ -61,16 +61,20 @@ jobs:
             os: ubuntu-22.04
             binary: horizon-launcher
             asset: horizon-launcher-linux-x86_64.tar.gz
+          # The arm64 pool has been unable to acquire a runner; cross-compile from Intel instead.
           - name: macos
-            os: macos-15
+            os: macos-15-intel
+            target: aarch64-apple-darwin
             binary: horizon-launcher
             asset: horizon-launcher-macos-arm64.zip
-          # Intel Macs: the same runner, another target.
+            optional: true
+          # Intel Macs: the same runner, native target.
           - name: macos-x64
-            os: macos-15
+            os: macos-15-intel
             target: x86_64-apple-darwin
             binary: horizon-launcher
             asset: horizon-launcher-macos-x64.zip
+            optional: true
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.optional == true }}
     timeout-minutes: 60
@@ -153,7 +157,8 @@ jobs:
 
   release:
     needs: [test, build]
-    # The ARM64 build is optional: the release goes out with whatever was built.
+    # The macOS builds are optional when GitHub's arm64/Intel pools have no runner: the release
+    # goes out with whatever was built.
     if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/launcher@') && needs.test.result == 'success' && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
