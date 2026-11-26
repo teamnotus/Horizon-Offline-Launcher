@@ -51,8 +51,11 @@ jobs:
           git rm -rf --quiet .
           git checkout FETCH_HEAD -- .
           # What this fork owns: the offline launcher, its releases and its identity.
-          rm -rf launcher .github packaging
-          git checkout origin/main -- launcher .github packaging exporters.tar.gz
+          rm -rf launcher .github
+          git checkout origin/main -- launcher .github exporters.tar.gz
+          # Overlay this fork's packaging (the installer and its URLs) on upstream's: upstream
+          # also ships files the build needs, such as packaging/windows/exe.rs.
+          git checkout origin/main -- packaging
           git checkout origin/main -- crates/horizon-release-sign/release-keys.txt \
             README.md AGENTS.md install.ps1 install.sh build.ps1
           # Upstream declares hooks in Rust now; a stale fork copy makes its build script fail.
