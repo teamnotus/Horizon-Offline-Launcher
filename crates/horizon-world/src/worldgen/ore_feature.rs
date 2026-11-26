@@ -112,6 +112,10 @@ pub struct OreFeature {
     size: i32,
     discard: f32,
     air: [BlockStateId; 3],
+    /// When no target rule draws from the random source (and there are at
+    /// most 32 targets): every Y range the rules test. Which targets match
+    /// is then a function of the state and the ranges holding Y.
+    heights: Option<Vec<(i32, i32)>>,
 }
 impl OreFeature {
     pub fn from_json(json: &str, bindings: &FeatureBlockBindings<'_>) -> Result<Self, DecodeError> {
@@ -138,11 +142,18 @@ impl OreFeature {
         if !(0.0..=1.0).contains(&discard) || discard.is_sign_negative() {
             return Err(DecodeError::Field("ore air exposure"));
         }
+        let mut heights = Vec::new();
+        let pure = targets
+            .iter()
+            .try_for_each(|(rule, _)| rule.pure_heights(&mut heights));
+        let heights =
+            (pure.is_some() && targets.len() <= 32 && heights.len() <= 64).then_some(heights);
         Ok(Self {
             targets,
             size,
             discard,
             air: bindings.air,
+            heights,
         })
     }
     pub fn place<W: FeatureWorld + PlacementContext>(
@@ -155,15 +166,21 @@ impl OreFeature {
         let spread_xy = self.size as f32 / 8.0;
         let max_radius = ((self.size as f32 / 16.0 * 2.0 + 1.0) / 2.0).ceil() as i32;
         let (ox, oz) = (f64::from(origin[0]), f64::from(origin[2]));
-        let (sin, cos) = (
-            horizon_core::jmath::sin(f64::from(dir)),
-            horizon_core::jmath::cos(f64::from(dir)),
-        );
         let spread = f64::from(spread_xy);
-        let x0 = ox + sin * spread;
-        let x1 = ox - sin * spread;
-        let z0 = oz + cos * spread;
-        let z1 = oz - cos * spread;
+        // The blob's ends, needed only once a column under it is found
+        // (most attempts high in To The Max's tall range find none).
+        let ends = || {
+            let (sin, cos) = (
+                horizon_core::jmath::sin(f64::from(dir)),
+                horizon_core::jmath::cos(f64::from(dir)),
+            );
+            [
+                ox + sin * spread,
+                ox - sin * spread,
+                oz + cos * spread,
+                oz - cos * spread,
+            ]
+        };
         let y0 = f64::from(
             origin[1]
                 .wrapping_add(random.next_int_bound(3)?)
@@ -193,7 +210,8 @@ impl OreFeature {
                 true => self.do_place(
                     world,
                     random,
-                    [x0, x1, z0, z1, y0, y1],
+                    ends(),
+                    [y0, y1],
                     [x_start, y_start, z_start],
                     size_xz,
                     size_y,
@@ -211,7 +229,8 @@ impl OreFeature {
                     return self.do_place(
                         world,
                         random,
-                        [x0, x1, z0, z1, y0, y1],
+                        ends(),
+                        [y0, y1],
                         [x_start, y_start, z_start],
                         size_xz,
                         size_y,
@@ -221,17 +240,28 @@ impl OreFeature {
         }
         Ok(false)
     }
+    #[allow(clippy::too_many_arguments)]
     fn do_place<W: FeatureWorld + PlacementContext>(
         &self,
         world: &mut W,
         random: &mut impl RandomSource,
-        [x0, x1, z0, z1, y0, y1]: [f64; 6],
+        [x0, x1, z0, z1]: [f64; 4],
+        [y0, y1]: [f64; 2],
         [x_start, y_start, z_start]: [i32; 3],
         size_xz: i32,
         size_y: i32,
     ) -> Result<bool, FeatureExecutionError<W::Error>> {
         let size = self.size as usize;
-        let mut data = vec![[0f64; 4]; size];
+        // Vanilla ore sizes are <= 64 and their bitsets fit in <= 64 words;
+        // keep both on the stack so each ore vein attempt makes zero heap allocations.
+        let mut data_stack = [[0f64; 4]; 64];
+        let mut data_heap = Vec::new();
+        let data: &mut [[f64; 4]] = if size <= data_stack.len() {
+            &mut data_stack[..size]
+        } else {
+            data_heap.resize(size, [0f64; 4]);
+            &mut data_heap
+        };
         for (i, entry) in data.iter_mut().enumerate() {
             let step = i as f32 / self.size as f32;
             let step64 = f64::from(step);
@@ -265,10 +295,19 @@ impl OreFeature {
             }
         }
         let tested_len = (size_xz as usize) * (size_y as usize) * (size_xz as usize);
-        let mut tested = vec![0u64; tested_len.div_ceil(64)];
+        let tested_words = tested_len.div_ceil(64);
+        let mut tested_stack = [0u64; 64];
+        let mut tested_heap = Vec::new();
+        let tested: &mut [u64] = if tested_words <= tested_stack.len() {
+            &mut tested_stack[..tested_words]
+        } else {
+            tested_heap.resize(tested_words, 0u64);
+            &mut tested_heap
+        };
         let mut placed = 0;
+        let mut matches = TargetMemo::default();
         let mut squares = SphereSquares::default();
-        for sphere in data {
+        for &sphere in &*data {
             if sphere[3] < 0.0 {
                 continue;
             }
@@ -304,8 +343,28 @@ impl OreFeature {
                 else {
                     return Ok(());
                 };
-                for (rule, target) in &self.targets {
-                    if !rule.test(state, p, random) {
+                let matched = match &self.heights {
+                    Some(heights) => {
+                        let ranges = heights.iter().enumerate().fold(0u64, |m, (i, &(lo, hi))| {
+                            m | u64::from(lo <= p[1] && p[1] <= hi) << i
+                        });
+                        matches.get(state, ranges, || {
+                            self.targets
+                                .iter()
+                                .enumerate()
+                                .fold(0u32, |m, (i, (rule, _))| {
+                                    m | u32::from(rule.test(state, p, random)) << i
+                                })
+                        })
+                    }
+                    None => u32::MAX,
+                };
+                for (i, (rule, target)) in self.targets.iter().enumerate() {
+                    if self.heights.is_some() {
+                        if matched >> i & 1 == 0 {
+                            continue;
+                        }
+                    } else if !rule.test(state, p, random) {
                         continue;
                     }
                     if !skip_air_check(random, self.discard) {
@@ -418,6 +477,26 @@ fn pass_run(squares: &[f64], lowest: usize, base: f64) -> Option<(usize, usize)>
         high += 1;
     }
     Some((low, high))
+}
+/// Recent (state, Y ranges) -> matching targets of a pure-rule ore.
+#[derive(Default)]
+struct TargetMemo {
+    entries: [(u32, u64, u32); 8],
+    len: usize,
+    next: usize,
+}
+impl TargetMemo {
+    fn get(&mut self, state: BlockStateId, ranges: u64, compute: impl FnOnce() -> u32) -> u32 {
+        let key = (state.0, ranges);
+        if let Some(e) = self.entries[..self.len].iter().find(|e| (e.0, e.1) == key) {
+            return e.2;
+        }
+        let value = compute();
+        self.entries[self.next] = (key.0, key.1, value);
+        self.next = (self.next + 1) % self.entries.len();
+        self.len = (self.len + 1).min(self.entries.len());
+        value
+    }
 }
 fn skip_air_check(random: &mut impl RandomSource, discard: f32) -> bool {
     if discard <= 0.0 {

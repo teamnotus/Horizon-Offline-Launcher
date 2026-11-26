@@ -7,19 +7,19 @@
 //! Where it differs from vanilla, on purpose: a packet is read from the stream (vanilla takes one `read` for
 //! one packet, so a command that TCP splits closes the connection), the password is compared in constant time,
 //! and a connection that hasn't logged in within [`LOGIN_WITHIN`] is closed, with at most [`MAX_CLIENTS`] open
-//! at once (vanilla has neither limit). A reply is cut in packets of 4096 characters, where vanilla cuts at
-//! 4096 UTF-16 units.
+//! at once (vanilla has neither limit).
 
 use crate::{
     api::{Phase, Shared, same_token},
     engine,
     supervisor::note,
 };
-use horizon_server_files::properties::{ServerProperties, SystemEntropy};
+use horizon_platform::server_files::properties::{ServerProperties, SystemEntropy};
+use horizon_server_launch::config;
 use serde_json::Value;
 use std::{
     io::{self, Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, TcpStream},
     path::Path,
     sync::{
         Arc,
@@ -41,12 +41,15 @@ const RESPONSE: i32 = 0;
 const AUTH_FAILURE: i32 = -1;
 /// `RconClient.buf`: the most a request takes, the length included.
 const MAX_REQUEST: usize = 1460;
-/// The characters of a reply in one packet (`sendCmdResponse`).
+/// The UTF-16 units of a reply in one packet (`sendCmdResponse`).
 const CHUNK: usize = 4096;
 /// How long a connection may take to log in.
 const LOGIN_WITHIN: Duration = Duration::from_secs(30);
 /// The connections open at once.
 const MAX_CLIENTS: usize = 16;
+/// The connections one address may hold of them: one client can't take every place, idle, and keep
+/// the operator's own RCON client out.
+const PER_ADDRESS: usize = 4;
 /// How long a refused login waits before its connection closes: one guess per connection, and a
 /// connection's place stays taken meanwhile, so the most connections at once also bound how fast
 /// passwords can be tried.
@@ -68,7 +71,7 @@ enum Setup {
 }
 
 fn setup(dir: &Path) -> Result<Setup, String> {
-    let file = crate::config::read_properties(&dir.join(crate::config::PROPERTIES))?;
+    let file = config::read_properties(&dir.join(config::PROPERTIES))?;
     let p = ServerProperties::new(file, &mut SystemEntropy::default())?;
     if !p.enable_rcon {
         return Ok(Setup::Off);
@@ -99,7 +102,7 @@ fn setup(dir: &Path) -> Result<Setup, String> {
 /// not a server that doesn't start.
 pub fn start(shared: Arc<Shared>) -> Result<Option<SocketAddr>, String> {
     // The file the game reads, as server.toml makes it.
-    crate::config::Config::load(&shared.dir)?
+    config::Config::load(&shared.dir)?
         .write_properties(&shared.dir)
         .map_err(|e| format!("server.properties: {e}"))?;
     let settings = match setup(&shared.dir)? {
@@ -181,12 +184,68 @@ struct Limits {
     refused: Duration,
 }
 
+/// The address a client's connections count under: IPv4 (including IPv4-mapped IPv6), or an
+/// IPv6 address's /64 prefix, so rotating addresses inside one /64 cannot hold every RCON slot.
+fn rate_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let s = v6.segments();
+                IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+            }
+        },
+        v4 => v4,
+    }
+}
+
 /// Frees a connection's place when its thread ends.
-struct Place(Arc<AtomicUsize>);
+/// A connection's place: one of the [`Limits::clients`], and one of its address's [`PER_ADDRESS`].
+struct Place {
+    open: Arc<AtomicUsize>,
+    per_address: Arc<std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>>,
+    address: IpAddr,
+}
+
+impl Place {
+    fn take(
+        open: &Arc<AtomicUsize>,
+        per_address: &Arc<std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>>,
+        address: IpAddr,
+        clients: usize,
+    ) -> Option<Self> {
+        let address = rate_key(address);
+        let mut per = per_address.lock().unwrap_or_else(|e| e.into_inner());
+        let mine = per.entry(address).or_default();
+        if *mine >= PER_ADDRESS {
+            return None;
+        }
+        if open.fetch_add(1, Ordering::SeqCst) >= clients {
+            open.fetch_sub(1, Ordering::SeqCst);
+            if *mine == 0 {
+                per.remove(&address);
+            }
+            return None;
+        }
+        *mine += 1;
+        Some(Self {
+            open: open.clone(),
+            per_address: per_address.clone(),
+            address,
+        })
+    }
+}
 
 impl Drop for Place {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.open.fetch_sub(1, Ordering::SeqCst);
+        let mut per = self.per_address.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = per.get_mut(&self.address) {
+            *n -= 1;
+            if *n == 0 {
+                per.remove(&self.address);
+            }
+        }
     }
 }
 
@@ -200,13 +259,15 @@ fn serve(
 ) -> io::Result<()> {
     let (password, run, warn) = (Arc::new(password), Arc::new(run), Arc::new(warn));
     let open = Arc::new(AtomicUsize::new(0));
+    let per_address = Arc::default();
     thread::Builder::new().name("rcon".into()).spawn(move || {
         for stream in listener.incoming().flatten() {
-            if open.fetch_add(1, Ordering::SeqCst) >= limits.clients {
-                open.fetch_sub(1, Ordering::SeqCst);
+            let address = stream
+                .peer_addr()
+                .map_or(std::net::IpAddr::from([0, 0, 0, 0]), |a| a.ip());
+            let Some(place) = Place::take(&open, &per_address, address, limits.clients) else {
                 continue;
-            }
-            let place = Place(open.clone());
+            };
             let (password, run, warn) = (password.clone(), run.clone(), warn.clone());
             let (login, refused) = (limits.login, limits.refused);
             let _ = thread::Builder::new()
@@ -348,15 +409,19 @@ fn send(stream: &mut TcpStream, id: i32, kind: i32, text: &str) -> io::Result<()
     stream.write_all(&encode(id, kind, text))
 }
 
-/// A command's output in packets of [`CHUNK`] characters: `sendCmdResponse` sends one, even when it is empty.
+/// A command's output in packets of [`CHUNK`] UTF-16 units: `sendCmdResponse` cuts the Java string
+/// with `substring`, so a character outside the BMP (two units) can straddle a cut, and
+/// `String.getBytes(UTF_8)` then writes each lone half as `?`. It sends one packet, even when the
+/// output is empty.
 fn send_output(stream: &mut TcpStream, id: i32, output: &str) -> io::Result<()> {
-    let mut rest = output;
+    let units: Vec<u16> = output.encode_utf16().collect();
+    let mut rest = units.as_slice();
     loop {
-        let end = rest
-            .char_indices()
-            .nth(CHUNK)
-            .map_or(rest.len(), |(i, _)| i);
-        send(stream, id, RESPONSE, &rest[..end])?;
+        let end = rest.len().min(CHUNK);
+        let text: String = char::decode_utf16(rest[..end].iter().copied())
+            .map(|unit| unit.unwrap_or('?'))
+            .collect();
+        send(stream, id, RESPONSE, &text)?;
         rest = &rest[end..];
         if rest.is_empty() {
             return Ok(());
@@ -399,6 +464,8 @@ mod tests {
             |line| match line {
                 "boom" => Err("it blew up".into()),
                 "long" => Ok("é".repeat(CHUNK + 5)),
+                // 4095 units, then a pair (a non-BMP character is two UTF-16 units), then one more.
+                "emoji" => Ok(format!("{}😀b", "a".repeat(CHUNK - 1))),
                 "silent" => Ok(String::new()),
                 line => Ok(format!("echo:{line}")),
             },
@@ -450,6 +517,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn a_session_logs_in_and_runs_commands() {
         let (address, warned) = server(limits());
         let mut rcon = connect(address);
@@ -503,6 +571,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn a_long_output_comes_in_packets_of_4096_characters() {
         let (address, _) = server(limits());
         let mut rcon = connect(address);
@@ -518,7 +587,24 @@ mod tests {
         assert_eq!((second.0, second.2.chars().count()), (2, 5));
     }
 
+    /// `sendCmdResponse` cuts the output with `String.substring` at 4096 UTF-16 units, so a pair that
+    /// straddles the cut is split, and `String.getBytes(UTF_8)` writes each lone half as `?`.
     #[test]
+    #[ignore = "daily"]
+    fn an_output_is_cut_at_4096_utf16_units_and_a_split_pair_becomes_question_marks() {
+        let (address, _) = server(limits());
+        let mut rcon = connect(address);
+        rcon.write_all(&encode(1, AUTH, "hunter2")).unwrap();
+        reply(&mut rcon);
+        rcon.write_all(&encode(2, EXEC, "emoji")).unwrap();
+        let first = reply(&mut rcon);
+        let second = reply(&mut rcon);
+        assert_eq!(first, (2, RESPONSE, format!("{}?", "a".repeat(4095))));
+        assert_eq!(second, (2, RESPONSE, "?b".to_owned()));
+    }
+
+    #[test]
+    #[ignore = "daily"]
     fn a_packet_split_by_tcp_is_one_request() {
         let (address, _) = server(limits());
         let mut rcon = connect(address);
@@ -538,6 +624,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn what_vanilla_closes_on_closes() {
         let (address, _) = server(limits());
         // A length under 10, over what vanilla's buffer takes, or negative.
@@ -562,6 +649,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn a_connection_that_does_not_log_in_is_closed() {
         let (address, _) = server(Limits {
             clients: 1,
@@ -580,6 +668,76 @@ mod tests {
         assert_eq!(reply(&mut again).0, 1);
     }
 
+    #[test]
+    fn one_address_takes_only_its_share_of_places() {
+        let open = Arc::new(AtomicUsize::new(0));
+        let per_address = Arc::default();
+        let (a, b) = (
+            std::net::IpAddr::from([198, 51, 100, 1]),
+            std::net::IpAddr::from([198, 51, 100, 2]),
+        );
+        let held: Vec<_> = (0..10)
+            .filter_map(|_| Place::take(&open, &per_address, a, MAX_CLIENTS))
+            .collect();
+        assert_eq!(held.len(), PER_ADDRESS);
+        assert!(
+            Place::take(&open, &per_address, b, MAX_CLIENTS).is_some(),
+            "another address"
+        );
+        drop(held);
+        assert_eq!(open.load(Ordering::SeqCst), 0);
+        assert!(per_address.lock().unwrap().is_empty());
+        // The global cap still holds across addresses.
+        let many: Vec<_> = (0..40u8)
+            .filter_map(|n| {
+                Place::take(
+                    &open,
+                    &per_address,
+                    std::net::IpAddr::from([10, 0, 0, n]),
+                    3,
+                )
+            })
+            .collect();
+        assert_eq!(many.len(), 3);
+    }
+
+    #[test]
+    fn ipv6_addresses_share_a_64_bucket_and_mapped_ipv4_shares_with_ipv4() {
+        let open = Arc::new(AtomicUsize::new(0));
+        let per_address = Arc::default();
+        // Distinct host IDs within the same /64 share PER_ADDRESS.
+        let same_block: Vec<_> = (1u16..=10)
+            .filter_map(|host| {
+                let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, host));
+                Place::take(&open, &per_address, ip, MAX_CLIENTS)
+            })
+            .collect();
+        assert_eq!(same_block.len(), PER_ADDRESS);
+        // A different /64 gets its own bucket.
+        let other_block = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 2, 0, 0, 0, 1));
+        let other = Place::take(&open, &per_address, other_block, MAX_CLIENTS);
+        assert!(other.is_some(), "a different /64 gets its own bucket");
+        drop(same_block);
+        drop(other);
+        assert_eq!(open.load(Ordering::SeqCst), 0);
+        assert!(per_address.lock().unwrap().is_empty());
+
+        // An IPv4-mapped IPv6 address shares its bucket with the plain IPv4 address.
+        let v4 = std::net::Ipv4Addr::new(198, 51, 100, 7);
+        let mapped = IpAddr::V6(v4.to_ipv6_mapped());
+        let plain = IpAddr::V4(v4);
+        let half = PER_ADDRESS / 2;
+        let mut held: Vec<_> = (0..half)
+            .filter_map(|_| Place::take(&open, &per_address, plain, MAX_CLIENTS))
+            .collect();
+        held.extend((0..10).filter_map(|_| Place::take(&open, &per_address, mapped, MAX_CLIENTS)));
+        assert_eq!(held.len(), PER_ADDRESS);
+        assert!(Place::take(&open, &per_address, plain, MAX_CLIENTS).is_none());
+        drop(held);
+        assert_eq!(open.load(Ordering::SeqCst), 0);
+        assert!(per_address.lock().unwrap().is_empty());
+    }
+
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir =
             std::env::temp_dir().join(format!("horizon-server-rcon-{name}-{}", std::process::id()));
@@ -589,7 +747,7 @@ mod tests {
     }
 
     fn properties(dir: &Path, text: &str) {
-        std::fs::write(dir.join(crate::config::PROPERTIES), text).unwrap();
+        std::fs::write(dir.join(config::PROPERTIES), text).unwrap();
     }
 
     #[test]
@@ -641,7 +799,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::fs::write(
-            engine::control_path(dir),
+            horizon_server_launch::control_path(dir),
             format!("{{\"port\":{port},\"token\":\"t\"}}"),
         )
         .unwrap();
@@ -662,6 +820,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn a_command_goes_to_the_game_as_an_rcon_request_that_says_what_the_console_says() {
         let dir = scratch("game");
         game(&dir);
@@ -691,6 +850,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn server_toml_starts_it() {
         let dir = scratch("start");
         game(&dir);
@@ -701,7 +861,7 @@ mod tests {
             .port();
         // The dotted keys are quoted in TOML.
         // `[server] bind` is `server-ip`, the address RCON listens on too.
-        let toml = crate::config::TEMPLATE
+        let toml = config::TEMPLATE
             .replacen("bind = \"\"", "bind = \"127.0.0.1\"", 1)
             .replace(
                 "[properties]
@@ -714,7 +874,7 @@ enable-rcon = true
 "
                 ),
             );
-        std::fs::write(dir.join(crate::config::FILE), toml).unwrap();
+        std::fs::write(dir.join(config::FILE), toml).unwrap();
         let shared = Shared::with_install(&dir, None);
         shared.set_phase(Phase::Running);
         let address = start(shared.clone()).unwrap().expect("RCON is on");

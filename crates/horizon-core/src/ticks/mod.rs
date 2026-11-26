@@ -55,9 +55,10 @@ impl ScheduledTick {
             .then_with(|| self.intra_cmp(other))
     }
     pub fn intra_cmp(self, other: Self) -> Ordering {
-        self.priority
-            .cmp(&other.priority)
-            .then_with(|| self.sub_tick_order.cmp(&other.sub_tick_order))
+        self.intra_key().cmp(&other.intra_key())
+    }
+    fn intra_key(self) -> (TickPriority, i64) {
+        (self.priority, self.sub_tick_order)
     }
     pub fn saved(self, game_time: i64) -> SavedTick {
         SavedTick {
@@ -110,7 +111,27 @@ impl ChunkTicks {
     pub fn poll(&mut self) -> Option<ScheduledTick> {
         let tick = self.queue.pop(ScheduledTick::drain_cmp)?;
         self.positions.remove(&tick.key());
+        self.trim();
         Some(tick)
+    }
+    /// The queue and its position set give back what they no longer use: generation schedules thousands of
+    /// ticks in a new chunk, and once they ran both kept their peak capacity for as long as the chunk stayed
+    /// loaded. Shrinking keeps the queue's order.
+    fn trim(&mut self) {
+        // The position set also holds the saved ticks not unpacked yet.
+        if self.pending.as_ref().is_some_and(|p| !p.is_empty()) {
+            return;
+        }
+        let len = self.queue.values.len();
+        if len == 0 {
+            if self.queue.values.capacity() > 0 {
+                self.queue.values = Vec::new();
+                self.positions = FxHashSet::default();
+            }
+        } else if self.queue.values.capacity() >= 64 && len * 4 < self.queue.values.capacity() {
+            self.queue.values.shrink_to(len * 2);
+            self.positions.shrink_to(len * 2);
+        }
     }
     /// First schedule wins for a type/position, irrespective of timing/priority.
     pub fn schedule(&mut self, tick: ScheduledTick) -> bool {
@@ -141,6 +162,7 @@ impl ChunkTicks {
             },
             ScheduledTick::drain_cmp,
         );
+        self.trim();
     }
     pub fn pack(&self, game_time: i64) -> Vec<SavedTick> {
         let mut saved = self.pending.clone().unwrap_or_default();
@@ -182,6 +204,44 @@ mod tests {
                 .unwrap();
         }
         level
+    }
+    /// A generation burst: thousands of ticks scheduled, some removed, then run. The trimmed queue keeps
+    /// the heap order of an untrimmed one at every step (vanilla's getAll order), polls the same ticks, and
+    /// gives its capacity back once drained.
+    #[test]
+    fn a_trimmed_queue_keeps_the_untrimmed_order_and_gives_memory_back() {
+        let mut chunk = ChunkTicks::default();
+        let mut plain: Heap<ScheduledTick> = Heap::default();
+        let mut seed = 0x2545_f491_u32;
+        let mut next = |n: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed % n
+        };
+        for order in 0..4000 {
+            let t = tick(
+                next(3),
+                next(16) as i32 + 1000 * order as i32,
+                next(40) as i64,
+                next(7) as i32 - 3,
+                order,
+            );
+            assert!(chunk.schedule(t));
+            plain.push(t, ScheduledTick::drain_cmp);
+        }
+        let cut = |t: ScheduledTick| t.pos.x % 7 == 0;
+        chunk.remove_if(cut);
+        plain.remove_if(cut, ScheduledTick::drain_cmp);
+        assert_eq!(chunk.queued(), &plain.values[..]);
+        while let Some(t) = chunk.poll() {
+            assert_eq!(Some(t), plain.pop(ScheduledTick::drain_cmp));
+            assert_eq!(chunk.queued(), &plain.values[..]);
+            assert!(!chunk.has_scheduled(t.pos, t.kind));
+        }
+        assert!(plain.values.is_empty());
+        assert_eq!(chunk.queue.values.capacity(), 0);
+        assert_eq!(chunk.positions.capacity(), 0);
     }
     #[test]
     fn due_chunks_compete_by_priority_not_trigger_time() {
@@ -228,6 +288,152 @@ mod tests {
         level.tick(0, 100, |_| true, |_, _| ran += 1).unwrap();
         assert_eq!(ran, 2);
         assert_eq!(level.count(), 0);
+    }
+    #[test]
+    fn dispatch_can_replace_the_head_of_a_deferred_chunk() {
+        let mut level = level();
+        let original = tick(0, 0, 0, 0, 0);
+        let deferred = tick(1, 16, 0, 0, 1);
+        let earlier = tick(2, 17, -1, -1, 2);
+        assert_eq!(level.schedule(original), ScheduleResult::Added);
+        assert_eq!(level.schedule(deferred), ScheduleResult::Added);
+
+        level.begin_tick(0, 1, |_| true).unwrap();
+        assert_eq!(level.next_tick().unwrap(), Some(original));
+        assert_eq!(level.schedule(earlier), ScheduleResult::Added);
+        assert!(!level.will_tick_this_tick(earlier.pos, earlier.kind));
+        assert!(level.has_scheduled(earlier.pos, earlier.kind));
+        assert_eq!(level.next_tick().unwrap(), None);
+        level.finish_tick().unwrap();
+
+        let mut ran = Vec::new();
+        level
+            .tick(0, 100, |_| true, |_, tick| ran.push(tick))
+            .unwrap();
+        assert_eq!(ran, [earlier, deferred]);
+        assert_eq!(level.count(), 0);
+    }
+    /// Reference collection keeps only chunk IDs and looks up live heads
+    /// for comparisons, as before caching. The deadline and JDK heap
+    /// primitives are unchanged and shared between implementations.
+    fn collect_with_live_heads(
+        level: &mut LevelTicks,
+        game_time: i64,
+        maximum: i32,
+        mut can_tick: impl FnMut(ChunkPos) -> bool,
+    ) -> Vec<ScheduledTick> {
+        let chunks = &mut level.chunks;
+        let deadlines = &mut level.deadlines;
+        let mut containers = Heap::<i64>::default();
+        let compare = |chunks: &FxHashMap<i64, ChunkTicks>, a, b| {
+            chunks[&a]
+                .peek()
+                .unwrap()
+                .intra_cmp(chunks[&b].peek().unwrap())
+        };
+        deadlines.visit(|key, deadline| {
+            if *deadline > game_time {
+                return false;
+            }
+            let Some(head) = chunks.get(&key).and_then(ChunkTicks::peek) else {
+                return true;
+            };
+            if head.trigger_tick > game_time {
+                *deadline = head.trigger_tick;
+                return false;
+            }
+            if !can_tick(ChunkPos::unpack(key)) {
+                return false;
+            }
+            containers.push(key, |a, b| compare(chunks, a, b));
+            true
+        });
+        let maximum = maximum.max(0) as usize;
+        let mut to_run = Vec::new();
+        while to_run.len() < maximum {
+            let Some(key) = containers.pop(|a, b| compare(chunks, a, b)) else {
+                break;
+            };
+            to_run.push(chunks.get_mut(&key).unwrap().poll().unwrap());
+            let competing = containers.peek().and_then(|key| chunks[&key].peek());
+            let chunk = chunks.get_mut(&key).unwrap();
+            while to_run.len() < maximum {
+                let Some(head) = chunk.peek() else {
+                    break;
+                };
+                if head.trigger_tick > game_time
+                    || competing.is_some_and(|other| head.intra_cmp(other) == Ordering::Greater)
+                {
+                    break;
+                }
+                to_run.push(chunk.poll().unwrap());
+            }
+            if let Some(head) = chunk.peek() {
+                if head.trigger_tick <= game_time && to_run.len() < maximum {
+                    containers.push(key, |a, b| compare(chunks, a, b));
+                } else {
+                    deadlines.put(key, head.trigger_tick);
+                }
+            }
+        }
+        for key in containers.values {
+            deadlines.put(key, chunks[&key].peek().unwrap().trigger_tick);
+        }
+        to_run
+    }
+    #[test]
+    fn cached_heads_match_live_head_collection_with_equal_keys() {
+        for seed in 1..=16u32 {
+            let mut state = seed;
+            let mut next = |n: u32| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state % n
+            };
+            let mut actual = LevelTicks::default();
+            for x in -20..=20 {
+                let pos = ChunkPos::new(x, 0);
+                // Each saved head unpacks with the same intra-order key.
+                // Other ticks become due later and compete across chunks.
+                let saved = tick(0, x * 16, -2, 0, 0).saved(0);
+                actual
+                    .add_chunk(pos, ChunkTicks::from_saved(vec![saved]))
+                    .unwrap();
+                actual.unpack_chunk(pos, 0);
+                for slot in 1..=next(12) as i32 {
+                    let scheduled = tick(
+                        0,
+                        x * 16 + slot,
+                        i64::from(next(7)) - 1,
+                        next(7) as i32 - 3,
+                        i64::from(next(5)) - 2,
+                    );
+                    assert_eq!(actual.schedule(scheduled), ScheduleResult::Added);
+                }
+            }
+            let mut reference = LevelTicks {
+                chunks: actual.chunks.clone(),
+                deadlines: actual.deadlines.clone(),
+                ..LevelTicks::default()
+            };
+
+            for (step, time) in [-2, -2, -1, 0, 1, 2, 3, 4, 5, 6].into_iter().enumerate() {
+                let (maximum, blocked) = match (step, time) {
+                    (0, _) => (-((seed % 2) as i32), 10),
+                    (_, 6) => (i32::MAX, 10),
+                    _ => (1 + next(24) as i32, next(10) as i32),
+                };
+                let can_tick = |pos: ChunkPos| pos.x.rem_euclid(10) != blocked;
+                let expected = collect_with_live_heads(&mut reference, time, maximum, can_tick);
+                let mut ran = Vec::new();
+                actual
+                    .tick(time, maximum, can_tick, |_, tick| ran.push(tick))
+                    .unwrap();
+                assert_eq!(ran, expected, "seed {seed}, step {step}, time {time}");
+            }
+            assert_eq!(actual.count(), 0);
+        }
     }
     #[test]
     fn pending_ticks_keep_list_order_and_java_time_overflow() {
@@ -351,11 +557,30 @@ impl std::fmt::Display for TickError {
 }
 impl std::error::Error for TickError {}
 
+/// The head's collection order and next deadline, without the block position
+/// and tick kind that are needed only when we poll the chunk itself.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DueChunk {
+    key: i64,
+    deadline: i64,
+    order: (TickPriority, i64),
+}
+impl DueChunk {
+    fn new(key: i64, head: ScheduledTick) -> Self {
+        Self {
+            key,
+            deadline: head.trigger_tick,
+            order: head.intra_key(),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct LevelTicks {
     chunks: FxHashMap<i64, ChunkTicks>,
     deadlines: DeadlineIndex,
-    containers_to_tick: Heap<i64>,
+    // Cached heads are live only during the exclusive borrow in begin_tick.
+    containers_to_tick: Heap<DueChunk>,
     to_run: VecDeque<ScheduledTick>,
     already_run: Vec<ScheduledTick>,
     to_run_set: FxHashSet<(TickTypeId, BlockPos)>,
@@ -422,6 +647,12 @@ impl LevelTicks {
     pub fn count(&self) -> usize {
         self.chunks.values().map(ChunkTicks::count).sum()
     }
+    /// Every unpacked queued tick, in no particular order.
+    pub fn all_queued(&self) -> impl Iterator<Item = &ScheduledTick> {
+        self.chunks.values().flat_map(|c| c.queued())
+    }
+    /// Collect due ticks for dispatch by [`Self::next_tick`]. Scheduling
+    /// during dispatch affects a later collection, not this batch.
     pub fn begin_tick(
         &mut self,
         game_time: i64,
@@ -434,12 +665,7 @@ impl LevelTicks {
         self.collecting = true;
         let mut containers = std::mem::take(&mut self.containers_to_tick);
         let chunks = &mut self.chunks;
-        let compare = |a: i64, b: i64| {
-            chunks[&a]
-                .peek()
-                .unwrap()
-                .intra_cmp(chunks[&b].peek().unwrap())
-        };
+        let compare = |a: DueChunk, b: DueChunk| a.order.cmp(&b.order);
         self.deadlines.visit(|key, deadline| {
             if *deadline > game_time {
                 return false;
@@ -454,29 +680,23 @@ impl LevelTicks {
             if !can_tick(ChunkPos::unpack(key)) {
                 return false;
             }
-            containers.push(key, compare);
+            containers.push(DueChunk::new(key, head), compare);
             true
         });
         let maximum = maximum.max(0) as usize;
         while self.to_run.len() < maximum {
-            let Some(key) = containers.pop(|a, b| {
-                self.chunks[&a]
-                    .peek()
-                    .unwrap()
-                    .intra_cmp(self.chunks[&b].peek().unwrap())
-            }) else {
+            let Some(DueChunk { key, .. }) = containers.pop(compare) else {
                 break;
             };
             let chunk = self.chunks.get_mut(&key).unwrap();
             self.to_run.push_back(chunk.poll().unwrap());
-            let competing = containers.peek().and_then(|key| self.chunks[&key].peek());
-            let chunk = self.chunks.get_mut(&key).unwrap();
+            let competing = containers.peek().map(|head| head.order);
             while self.to_run.len() < maximum {
                 let Some(head) = chunk.peek() else {
                     break;
                 };
                 if head.trigger_tick > game_time
-                    || competing.is_some_and(|other| head.intra_cmp(other) == Ordering::Greater)
+                    || competing.is_some_and(|other| head.intra_key() > other)
                 {
                     break;
                 }
@@ -484,20 +704,14 @@ impl LevelTicks {
             }
             if let Some(head) = chunk.peek() {
                 if head.trigger_tick <= game_time && self.to_run.len() < maximum {
-                    containers.push(key, |a, b| {
-                        self.chunks[&a]
-                            .peek()
-                            .unwrap()
-                            .intra_cmp(self.chunks[&b].peek().unwrap())
-                    });
+                    containers.push(DueChunk::new(key, head), compare);
                 } else {
                     self.deadlines.put(key, head.trigger_tick);
                 }
             }
         }
-        for &key in &containers.values {
-            self.deadlines
-                .put(key, self.chunks[&key].peek().unwrap().trigger_tick);
+        for head in &containers.values {
+            self.deadlines.put(head.key, head.deadline);
         }
         containers.values.clear();
         self.containers_to_tick = containers;

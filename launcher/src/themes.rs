@@ -6,7 +6,7 @@
 //! accent and the main action's face, bevel and lip) to it, keeping their saturation and
 //! lightness, then darkens or lightens each just enough to read as well as the violet does: white
 //! on the face at 4.5:1, the accent at 3:1 on every background.
-use horizon_theme::night::{Night, SkyArt};
+use horizon_theme::night::{Land, Mood, Night, SkyArt};
 use horizon_theme::{contrast, Blocks};
 use std::path::{Path, PathBuf};
 
@@ -82,6 +82,8 @@ pub const NORD_DARK: Night = Night {
         lit: [0x4c566a, 0x5e6a7d, 0x81a1c1],
         shade: 0x272c36,
         star: 0xeceff4,
+        mood: Mood::Plain,
+        land: Land::Plain,
     },
 };
 
@@ -114,6 +116,8 @@ pub const NORD_LIGHT: Night = Night {
         lit: [0xffffff; 3],
         shade: 0xd8dee9,
         star: 0xffffff,
+        mood: Mood::Plain,
+        land: Land::Plain,
     },
 };
 

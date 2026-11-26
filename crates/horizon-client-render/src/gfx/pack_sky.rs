@@ -4,7 +4,7 @@
 //! uniform (set 1) that the vertex inputs read. `gbuffers_skytextured` draws the frame's sun and
 //! moon quads, textured from the shared atlas.
 
-use std::ops::Range;
+use std::{ops::Range, sync::Mutex};
 
 use wgpu::util::DeviceExt;
 
@@ -102,8 +102,12 @@ pub fn inputs() -> horizon_shaders::GbuffersInputs {
         // depth. Its fragments read their own depth, as in Iris.
         after: String::new(),
         alpha_test: None,
+        parts: None,
         item_id_declared: false,
         far_depth: true,
+        paged_maps: false,
+        water_mask: false,
+        water_patches: false,
     }
 }
 
@@ -129,8 +133,12 @@ pub fn celestial_inputs() -> horizon_shaders::GbuffersInputs {
         ],
         after: String::new(),
         alpha_test: None,
+        parts: None,
         item_id_declared: false,
         far_depth: true,
+        paged_maps: false,
+        water_mask: false,
+        water_patches: false,
     }
 }
 
@@ -221,6 +229,7 @@ pub(super) struct PackSky {
     uniform: wgpu::Buffer,
     pub layout: wgpu::BindGroupLayout,
     group: wgpu::BindGroup,
+    celestial_scratch: Mutex<Vec<Celestial>>,
     /// Vertex ranges of the sky disc, the sunset fan, the stars, the void and the End's fan.
     ranges: [Range<u32>; 5],
 }
@@ -300,6 +309,7 @@ impl PackSky {
             uniform,
             layout,
             group,
+            celestial_scratch: Mutex::new(Vec::new()),
             ranges: [sky, sunset, stars, void, end_fan],
         }
     }
@@ -325,7 +335,13 @@ impl PackSky {
     /// camera low, the void. `tilt` is the pack's `sunPathRotation` (degrees): the sun, moon
     /// and stars turn with it (7.1). In the End under the dragon fight's fog, only the End's fan,
     /// in the fog colour (`fogColor`), as stage SKY.
-    pub fn prepare(&self, queue: &wgpu::Queue, frame: &super::Frame, tilt: f32) -> Vec<Part> {
+    pub fn prepare(
+        &self,
+        queue: &wgpu::Queue,
+        frame: &super::Frame,
+        tilt: f32,
+        visibility: horizon_shaders::SkyVisibility,
+    ) -> Vec<Part> {
         let turn = super::pack_uniforms::tilt_matrix(tilt);
         let sun_angle = frame.sky.sun_angle.to_radians();
         // The fan turns to the other horizon in the afternoon (terrain.wgsl's sunrise_weight).
@@ -357,39 +373,23 @@ impl PackSky {
             .0
             .iter()
             .take(CELESTIAL_QUADS);
-        let triangles: Vec<Celestial> = quads
-            .clone()
-            .flat_map(|q| [0, 1, 2, 0, 2, 3].map(|i| q[i]))
-            .map(|v| Celestial {
-                pos: turn.transform_vector3(v.pos.into()).into(),
-                uv: v.uv,
-                color: v.color,
-            })
-            .collect();
+        let mut triangles = self
+            .celestial_scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        triangles.clear();
+        triangles.extend(
+            quads
+                .clone()
+                .flat_map(|q| [0, 1, 2, 0, 2, 3].map(|i| q[i]))
+                .map(|v| Celestial {
+                    pos: turn.transform_vector3(v.pos.into()).into(),
+                    uv: v.uv,
+                    color: v.color,
+                }),
+        );
         queue.write_buffer(&self.celestial, 0, bytemuck::cast_slice(&triangles));
-        let [sky, sunset, stars, void, fan] = self.ranges.clone();
-        let part = |stage, textured, range| Part {
-            stage,
-            textured,
-            range,
-        };
-        if end_fan {
-            return vec![part("SKY", false, fan)];
-        }
-        let mut parts = vec![part("SKY", false, sky)];
-        if frame.sky.sunrise_color[3] > 0.001 {
-            parts.push(part("SUNSET", false, sunset));
-        }
-        for (i, stage) in ["SUN", "MOON"].into_iter().enumerate().take(quads.len()) {
-            parts.push(part(stage, true, i as u32 * 6..i as u32 * 6 + 6));
-        }
-        if frame.stars.is_some() {
-            parts.push(part("STARS", false, stars));
-        }
-        if frame.dark_disc {
-            parts.push(part("VOID", false, void));
-        }
-        parts
+        parts(self.ranges.clone(), frame, quads.len(), visibility)
     }
 
     /// Binds the vertices of the `textured` (sun and moon) or other parts.
@@ -401,4 +401,44 @@ impl PackSky {
             pass.set_vertex_buffer(0, self.vertices.slice(..));
         }
     }
+}
+
+/// The vanilla sky request covers its disc, horizon, sunset and void. The End fog fan
+/// is independent of the Overworld sky and returns before filtering.
+pub(super) fn parts(
+    ranges: [Range<u32>; 5],
+    frame: &super::Frame,
+    quads: usize,
+    visibility: horizon_shaders::SkyVisibility,
+) -> Vec<Part> {
+    let [sky, sunset, stars, void, fan] = ranges;
+    let part = |stage, textured, range| Part {
+        stage,
+        textured,
+        range,
+    };
+    if super::end_fog_sky(frame) {
+        return vec![part("SKY", false, fan)];
+    }
+    let mut parts = vec![part("SKY", false, sky)];
+    if frame.sky.sunrise_color[3] > 0.001 {
+        parts.push(part("SUNSET", false, sunset));
+    }
+    for (i, stage) in ["SUN", "MOON"].into_iter().enumerate().take(quads) {
+        parts.push(part(stage, true, i as u32 * 6..i as u32 * 6 + 6));
+    }
+    if frame.stars.is_some() {
+        parts.push(part("STARS", false, stars));
+    }
+    if frame.dark_disc {
+        parts.push(part("VOID", false, void));
+    }
+    parts.retain(|part| match part.stage {
+        "SKY" | "SUNSET" | "VOID" => visibility.sky,
+        "STARS" => visibility.stars,
+        "SUN" => visibility.sun,
+        "MOON" => visibility.moon,
+        _ => true,
+    });
+    parts
 }

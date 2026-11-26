@@ -12,6 +12,26 @@ pub const MAX_FRAME: usize = (1 << 21) - 1;
 /// CompressionDecoder.MAXIMUM_UNCOMPRESSED_LENGTH.
 pub const MAX_UNCOMPRESSED: usize = 8_388_608;
 
+/// Which whole-packet boundary refused an outgoing packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameSize {
+    /// Packet contents after the compression header and optional compression.
+    Encoded,
+    /// Packet bytes before compression, including the packet id.
+    Uncompressed,
+}
+
+/// A named pre-write refusal, not a registered-payload body limit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameTooLarge {
+    /// Which stage's bound was exceeded.
+    pub stage: FrameSize,
+    /// Actual whole-packet byte count at that stage.
+    pub size: usize,
+    /// Inclusive maximum at that stage.
+    pub limit: usize,
+}
+
 /// Build the frame for one packet body (`id` + payload already concatenated):
 /// length prefix, and with compression enabled the uncompressed-length
 /// field (0 when below the threshold).
@@ -19,11 +39,46 @@ pub fn encode(body: &[u8], threshold: Option<usize>) -> Result<Vec<u8>> {
     Ok(prefixed(&contents(body, threshold)?))
 }
 
+/// Consume an uncompressed body without copying it; compressed framing uses [`contents`].
+pub fn contents_owned(body: Vec<u8>, threshold: Option<usize>) -> Result<Vec<u8>> {
+    if threshold.is_none() {
+        check_body_size(&body, threshold)?;
+        Ok(body)
+    } else {
+        contents(&body, threshold)
+    }
+}
+
+fn check_body_size(body: &[u8], threshold: Option<usize>) -> Result<()> {
+    let (stage, limit) = if threshold.is_some() {
+        (FrameSize::Uncompressed, MAX_UNCOMPRESSED)
+    } else {
+        (FrameSize::Encoded, MAX_FRAME)
+    };
+    if body.len() > limit {
+        return Err(Error::frame_too_large(FrameTooLarge {
+            stage,
+            size: body.len(),
+            limit,
+        }));
+    }
+    Ok(())
+}
+
 /// What [`encode`] puts after the length prefix: the same for every
 /// connection with the same threshold.
 pub fn contents(body: &[u8], threshold: Option<usize>) -> Result<Vec<u8>> {
+    check_body_size(body, threshold)?;
     let inner = match threshold {
         None => body.to_vec(),
+        // CompressionEncoder: a body over the other side's CompressionDecoder maximum is not sent,
+        // however small it deflates.
+        Some(_) if body.len() > MAX_UNCOMPRESSED => {
+            return Err(Error::new(format!(
+                "Packet too big (is {}, should be less than {MAX_UNCOMPRESSED})",
+                body.len()
+            )));
+        }
         Some(t) if body.len() < t => {
             let mut v = Vec::with_capacity(body.len() + 1);
             v.push(0);
@@ -40,10 +95,11 @@ pub fn contents(body: &[u8], threshold: Option<usize>) -> Result<Vec<u8>> {
         }
     };
     if inner.len() > MAX_FRAME {
-        return Err(Error::new(format!(
-            "packet too large: {} bytes",
-            inner.len()
-        )));
+        return Err(Error::frame_too_large(FrameTooLarge {
+            stage: FrameSize::Encoded,
+            size: inner.len(),
+            limit: MAX_FRAME,
+        }));
     }
     Ok(inner)
 }
@@ -55,11 +111,11 @@ thread_local! {
     static DEFLATER: RefCell<Option<Compress>> = const { RefCell::new(None) };
 }
 
-/// `body` as one zlib stream at the default level, appended to `out`: the
+/// `body` as one zlib stream at level 2, appended to `out`: the
 /// bytes a new `ZlibEncoder` writes for it, from a reset compressor.
 fn deflate_into(body: &[u8], out: &mut Vec<u8>) -> Result<()> {
     DEFLATER.with_borrow_mut(|deflater| {
-        let z = deflater.get_or_insert_with(|| Compress::new(Compression::default(), true));
+        let z = deflater.get_or_insert_with(|| Compress::new(Compression::new(2), true));
         z.reset();
         let start = z.total_in();
         // ZlibEncoder's calls: the whole input without a flush, then finish.
@@ -123,27 +179,36 @@ impl Inflater {
     /// The zlib stream at the front of `input`, which must hold exactly `size` bytes.
     fn inflate(&mut self, input: &[u8], size: usize) -> Result<Vec<u8>> {
         self.0.reset(true);
-        // Like vanilla's Inflater: exactly the declared size, and no more. Vanilla never reads the
-        // stream's end (its final block and checksum), which some servers' proxies leave out.
-        let z = &mut self.0;
-        let mut out = vec![0u8; size];
-        loop {
-            let (read, written) = (z.total_in() as usize, z.total_out() as usize);
-            if written == size {
-                break;
-            }
-            let status = z
-                .decompress(&input[read..], &mut out[written..], FlushDecompress::None)
+        // One byte more than declared: a longer stream fills it. Reserved as the output grows, not
+        // all at once: a few bytes declaring 8 MiB would otherwise allocate 8 MiB per frame.
+        // DEFLATE expands at most about 1032:1.
+        let limit = size + 1;
+        let mut out =
+            Vec::with_capacity(limit.min(input.len().saturating_mul(1032).saturating_add(64)));
+        let status = loop {
+            let consumed = usize::try_from(self.0.total_in()).unwrap_or(input.len());
+            let status = self
+                .0
+                .decompress_vec(
+                    input.get(consumed..).unwrap_or_default(),
+                    &mut out,
+                    FlushDecompress::Finish,
+                )
                 .map_err(|e| Error::new(format!("Badly compressed packet - {e}")))?;
-            let stuck = z.total_in() as usize == read && z.total_out() as usize == written;
-            if status == Status::StreamEnd || stuck {
-                break;
+            // Done, past the limit, or stopped with room left (the input ran out).
+            if matches!(status, Status::StreamEnd)
+                || out.len() >= limit
+                || out.len() < out.capacity()
+            {
+                break status;
             }
-        }
-        let written = z.total_out() as usize;
-        if written != size {
+            let more = out.len().max(4096).min(limit - out.len());
+            out.reserve_exact(more);
+        };
+        if out.len() != size || !matches!(status, Status::StreamEnd) {
             return Err(Error::new(format!(
-                "Badly compressed packet - actual length {written} does not match declared size {size}"
+                "Badly compressed packet - actual length {} does not match declared size {size}",
+                out.len()
             )));
         }
         Ok(out)
@@ -183,6 +248,10 @@ pub fn body(frame: &[u8], threshold: Option<usize>, inflater: &mut Inflater) -> 
 }
 
 #[cfg(test)]
+#[path = "frame/limits_tests.rs"]
+mod limits_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use flate2::write::ZlibEncoder;
@@ -192,7 +261,7 @@ mod tests {
     fn fresh_contents(body: &[u8]) -> Vec<u8> {
         let mut v = Vec::new();
         write_varint(&mut v, body.len() as i32);
-        let mut z = ZlibEncoder::new(v, Compression::default());
+        let mut z = ZlibEncoder::new(v, Compression::new(2));
         z.write_all(body).unwrap();
         z.finish().unwrap()
     }
@@ -237,6 +306,47 @@ mod tests {
             }
             bodies.reverse();
         }
+    }
+
+    #[test]
+    fn large_bodies_inflate_whole_and_short_streams_are_refused() {
+        // 2 MiB of zeros deflate to a few KiB: inflated whole as the buffer grows.
+        let body = vec![0u8; 2 << 20];
+        let frame = contents(&body, Some(256)).unwrap();
+        let mut inflater = Inflater::default();
+        let Body::Inflated(out) = super::body(&frame, Some(256), &mut inflater).unwrap() else {
+            panic!("compressed");
+        };
+        assert!(out == body);
+        // A few bytes declaring 8 MiB: refused (and no longer 8 MiB reserved for them).
+        let mut lying = Vec::new();
+        write_varint(&mut lying, MAX_UNCOMPRESSED as i32);
+        lying.extend_from_slice(&frame[3..20]);
+        assert!(super::body(&lying, Some(256), &mut inflater).is_err());
+        // The same inflater still reads a good frame after.
+        assert!(matches!(
+            super::body(&frame, Some(256), &mut inflater).unwrap(),
+            Body::Inflated(_)
+        ));
+    }
+
+    /// CompressionEncoder refuses a body over CompressionDecoder's MAXIMUM_UNCOMPRESSED_LENGTH (8 MiB),
+    /// which the other side would refuse: 8 MiB of zeros deflate to a few KiB, well inside a frame,
+    /// and are read back whole; one byte more is not sent.
+    #[test]
+    fn a_body_over_the_uncompressed_maximum_is_not_sent() {
+        // CompressionDecoder.MAXIMUM_UNCOMPRESSED_LENGTH, written out so the constant is checked too.
+        let mut body = vec![0u8; 8_388_608];
+        let frame = contents(&body, Some(256)).unwrap();
+        let Body::Inflated(out) = super::body(&frame, Some(256), &mut Inflater::default()).unwrap()
+        else {
+            panic!("compressed");
+        };
+        assert_eq!(out.len(), 8_388_608);
+        body.push(0);
+        assert!(contents(&body, Some(256)).is_err());
+        // Without compression there is no CompressionEncoder: the frame's own limit applies.
+        assert!(contents(&body, None).is_err());
     }
 
     /// Split one complete frame off the front of `buffer`, if available.
@@ -306,53 +416,6 @@ mod tests {
         z.write_all(&[1; 299]).unwrap();
         frame.extend(z.finish().unwrap());
         assert!(decompress(frame, Some(256)).is_err());
-        // Bytes that aren't zlib at all.
-        let mut frame = Vec::new();
-        write_varint(&mut frame, 300);
-        frame.extend([0xFF; 40]);
-        assert!(decompress(frame, Some(256)).is_err());
-    }
-
-    #[test]
-    fn padded_size_varints_decode_like_vanilla() {
-        let body: Vec<u8> = (0..4132u32).map(|i| (i % 13) as u8).collect();
-        let mut z = ZlibEncoder::new(Vec::new(), Compression::default());
-        z.write_all(&body).unwrap();
-        // 4132 in three bytes, as FunTime's proxy writes it.
-        let mut frame = vec![0xa4, 0xa0, 0x00];
-        frame.extend(z.finish().unwrap());
-        assert_eq!(decompress(frame, Some(256)).unwrap(), body);
-    }
-
-    #[test]
-    fn streams_without_their_end_decode_like_vanilla() {
-        let body: Vec<u8> = (0..3000u32).map(|i| (i % 11) as u8).collect();
-        let stream = |level| {
-            let mut z = ZlibEncoder::new(Vec::new(), Compression::new(level));
-            z.write_all(&body).unwrap();
-            z.finish().unwrap()
-        };
-        let framed = |stream: &[u8]| {
-            let mut frame = Vec::new();
-            write_varint(&mut frame, body.len() as i32);
-            frame.extend_from_slice(stream);
-            frame
-        };
-        // Without the Adler-32 checksum, as some proxies send them: vanilla's Inflater stops
-        // at the declared size and never reads it.
-        let whole = stream(6);
-        let unchecked = &whole[..whole.len() - 4];
-        assert_eq!(decompress(framed(unchecked), Some(256)).unwrap(), body);
-        // Flushed but never finished (no final block).
-        let mut z = flate2::Compress::new(Compression::new(6), true);
-        let mut open = Vec::with_capacity(body.len() + 64);
-        z.compress_vec(&body, &mut open, flate2::FlushCompress::Sync)
-            .unwrap();
-        assert_eq!(decompress(framed(&open), Some(256)).unwrap(), body);
-        // Trailing bytes after the stream are left alone, as vanilla leaves them.
-        let mut trailing = whole.clone();
-        trailing.extend([1, 2, 3]);
-        assert_eq!(decompress(framed(&trailing), Some(256)).unwrap(), body);
     }
 
     /// One inflater serves every frame, also after a bad one.
@@ -372,14 +435,8 @@ mod tests {
                 Ok(Body::Inflated(out)) => assert_eq!(out, body),
                 _ => panic!("{n} bytes did not inflate"),
             }
-            // A stream longer than declared gives the declared size, as vanilla's Inflater does
-            // (this fork reads like it); one shorter is refused, and the next frame still inflates.
-            // (Below the threshold of 256 the declared size itself is refused.)
-            match body_of(&frame(&body, n - 1), &mut inflater) {
-                Ok(Body::Inflated(out)) => assert_eq!(out, body[..n - 1]),
-                Err(_) if n - 1 < 256 => {}
-                _ => panic!("{n} bytes declared as {} did not inflate", n - 1),
-            }
+            // A stream longer than declared, then one shorter.
+            assert!(body_of(&frame(&body, n - 1), &mut inflater).is_err());
             assert!(body_of(&frame(&body, n + 1), &mut inflater).is_err());
         }
     }

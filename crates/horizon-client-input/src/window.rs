@@ -29,6 +29,24 @@ pub fn gui_scaled_size(framebuffer: [i32; 2], gui_scale: i32) -> [i32; 2] {
     [scaled(framebuffer[0]), scaled(framebuffer[1])]
 }
 
+/// The GUI dimensions shared by screen layout and resize notifications.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuiSize {
+    pub scale: u32,
+    pub size: [u32; 2],
+}
+
+impl GuiSize {
+    pub fn new(framebuffer: [u32; 2], max_scale: u32, enforce_unicode: bool) -> Self {
+        let framebuffer = framebuffer.map(|v| v as i32);
+        let scale = calculate_scale(framebuffer, max_scale as i32, enforce_unicode);
+        Self {
+            scale: scale as u32,
+            size: gui_scaled_size(framebuffer, scale).map(|v| v as u32),
+        }
+    }
+}
+
 /// `MouseHandler.getScaledXPos`/`getScaledYPos`.
 pub fn scaled_pos(pos: f64, gui_scaled: i32, screen: i32) -> f64 {
     pos * f64::from(gui_scaled) / f64::from(screen)
@@ -130,16 +148,21 @@ pub fn vsync_present_mode(supported: &[PresentMode], vsync: bool) -> Option<Pres
 
 /// The present mode for the VSync option and Horizon's present-mode setting
 /// (`None` for Auto). VSync on always means Fifo, in a window and in
-/// fullscreen alike, as in vanilla; the setting chooses only while VSync is
-/// off, when the surface supports it, and otherwise vanilla's choice applies.
+/// fullscreen alike, as in vanilla. With VSync off, explicit Mailbox
+/// falls back to tear-free Fifo rather than Immediate; other modes
+/// fall back to vanilla's choice when unavailable.
 pub fn chosen_present_mode(
     supported: &[PresentMode],
     vsync: bool,
     setting: Option<PresentMode>,
 ) -> Option<PresentMode> {
-    setting
-        .filter(|m| !vsync && supported.contains(m))
-        .or_else(|| vsync_present_mode(supported, vsync))
+    match setting {
+        Some(PresentMode::Mailbox) if !vsync => [PresentMode::Mailbox, PresentMode::Fifo]
+            .into_iter()
+            .find(|mode| supported.contains(mode)),
+        Some(mode) if !vsync && supported.contains(&mode) => Some(mode),
+        _ => vsync_present_mode(supported, vsync),
+    }
 }
 
 /// `FramerateLimiter.limitDisplayFPS` with an injectable clock so the sleep
@@ -638,12 +661,33 @@ pub fn fullscreen_request(
     }
 }
 
-/// Horizon's icon for the window's title bar and the task bar (X11 and Windows; Wayland takes
-/// it from the `horizon.desktop` entry, macOS from the app bundle). `None` if it can't be read.
+/// The PNG the windows show as their icon, given once at startup by the layer that brands the
+/// game (the engine has none of its own).
+static ICON_PNG: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
+
+/// Give the windows their icon, a PNG: call it before the first window opens. A second call
+/// keeps the first icon.
+pub fn set_icon_png(png: &'static [u8]) {
+    let _ = ICON_PNG.set(png);
+}
+
+/// The icon given to [`set_icon_png`], if any.
+pub fn icon_png() -> Option<&'static [u8]> {
+    ICON_PNG.get().copied()
+}
+
+/// The icon for the window's title bar and the task bar (X11 and Windows; Wayland takes it from
+/// the `.desktop` entry, macOS from the app bundle). `None` with no icon given, or one that
+/// can't be read.
 pub fn icon() -> Option<winit::window::Icon> {
-    let mut decoder = png::Decoder::new(std::io::Cursor::new(horizon_theme::ICON_PNG));
+    decode_icon(icon_png()?)
+}
+
+/// A window icon from an RGBA, RGB or palette PNG (expanded to RGBA), None when it does not decode.
+pub fn decode_icon(png: &[u8]) -> Option<winit::window::Icon> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(png));
     decoder.ignore_checksums(true);
-    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    decoder.set_transformations(png::Transformations::ALPHA | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info().ok()?;
     let mut bytes = vec![0; reader.output_buffer_size()?];
     let info = reader.next_frame(&mut bytes).ok()?;
@@ -654,15 +698,19 @@ pub fn icon() -> Option<winit::window::Icon> {
     winit::window::Icon::from_rgba(bytes, info.width, info.height).ok()
 }
 
-/// Apply Horizon's icon to every window. Windows has a separate taskbar icon slot from the small
-/// window icon; requiring the decoded icon there prevents a generic taskbar icon from appearing.
-pub fn with_horizon_icon(
-    attributes: winit::window::WindowAttributes,
-) -> winit::window::WindowAttributes {
+/// Apply the icon given to [`set_icon_png`] and the vanilla minimum inner size (320x240) to a window.
+/// Windows has a separate taskbar icon slot from the small window icon; requiring a given icon to
+/// decode there prevents a generic taskbar icon from appearing.
+pub fn with_icon(attributes: winit::window::WindowAttributes) -> winit::window::WindowAttributes {
+    #[cfg(not(target_os = "windows"))]
     let icon = icon();
     #[cfg(target_os = "windows")]
-    let icon = Some(icon.expect("Horizon's icon must be available on Windows"));
+    let icon =
+        icon_png().map(|png| decode_icon(png).expect("the window icon must decode on Windows"));
 
+    // Vanilla 26.3 Window.createWindow: SDL_SetWindowMinimumSize(windowHandle, 320, 240).
+    let attributes =
+        attributes.with_min_inner_size(winit::dpi::LogicalSize::new(320.0f64, 240.0f64));
     let attributes = attributes.with_window_icon(icon.clone());
     #[cfg(target_os = "windows")]
     let attributes =
@@ -670,9 +718,81 @@ pub fn with_horizon_icon(
     attributes
 }
 
+/// The screen a window is on: its size in physical pixels, its refresh rate where the OS gives
+/// it, and its scale. For `horizon-ctl status` and the performance statistics' `system.display`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Display {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_hz: Option<u32>,
+    pub scale: f64,
+}
+
+/// The screen `window` is on, else the primary one, else the only one: right after the window
+/// is made, Wayland doesn't say yet which screen it is on.
+pub fn monitor(window: &winit::window::Window) -> Option<winit::monitor::MonitorHandle> {
+    let only = || {
+        let mut all = window.available_monitors();
+        all.next().filter(|_| all.next().is_none())
+    };
+    window
+        .current_monitor()
+        .or_else(|| window.primary_monitor())
+        .or_else(only)
+}
+
+/// [`monitor`]'s size, refresh rate and scale.
+pub fn display(window: &winit::window::Window) -> Option<Display> {
+    monitor(window).map(|m| Display {
+        width: m.size().width,
+        height: m.size().height,
+        refresh_hz: m.refresh_rate_millihertz().map(|r| r.div_ceil(1000)),
+        scale: m.scale_factor(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_gui_size_applies_unicode_and_rounds_up() {
+        assert_eq!(
+            GuiSize::new([960, 720], 3, false),
+            GuiSize {
+                scale: 3,
+                size: [320, 240]
+            }
+        );
+        assert_eq!(
+            GuiSize::new([960, 720], 3, true),
+            GuiSize {
+                scale: 4,
+                size: [240, 180]
+            }
+        );
+        assert_eq!(
+            GuiSize::new([1921, 1081], 0, false),
+            GuiSize {
+                scale: 4,
+                size: [481, 271]
+            }
+        );
+        assert_eq!(
+            GuiSize::new([853, 479], 0, true),
+            GuiSize {
+                scale: 2,
+                size: [427, 240]
+            }
+        );
+        assert_eq!(
+            GuiSize::new([3840, 2160], 0, true),
+            GuiSize {
+                scale: 10,
+                size: [384, 216]
+            }
+        );
+    }
 
     #[test]
     fn video_mode_round_trips_the_options_json() {
@@ -706,7 +826,8 @@ mod tests {
     }
     #[test]
     fn the_window_icon_decodes() {
-        assert!(icon().is_some());
+        assert!(decode_icon(horizon_theme::ICON_PNG).is_some());
+        assert!(decode_icon(b"not a png").is_none());
     }
 
     #[test]
@@ -967,9 +1088,14 @@ mod tests {
             Some(Mailbox)
         );
         assert_eq!(chosen_present_mode(&all, false, Some(Fifo)), Some(Fifo));
-        // Metal has no Mailbox: vanilla's choice instead.
+        // A surface without Mailbox can still honor the explicit tear-free choice.
+        let without_mailbox = [Fifo, Immediate];
         assert_eq!(
-            chosen_present_mode(&[Fifo, Immediate], false, Some(Mailbox)),
+            chosen_present_mode(&without_mailbox, false, Some(Mailbox)),
+            Some(Fifo)
+        );
+        assert_eq!(
+            chosen_present_mode(&without_mailbox, false, None),
             Some(Immediate)
         );
     }
@@ -996,5 +1122,79 @@ mod tests {
         assert_eq!(list.refresh(None, &mut modes), Some(vec![]));
         assert_eq!(list.refresh(Some(2), &mut modes), Some(vec![mode(2)]));
         assert_eq!(listings, 3);
+    }
+
+    #[test]
+    fn with_icon_enforces_vanilla_minimum_inner_size() {
+        let attrs = with_icon(winit::window::Window::default_attributes());
+        assert_eq!(
+            attrs.min_inner_size,
+            Some(winit::dpi::Size::Logical(winit::dpi::LogicalSize::new(
+                320.0f64, 240.0f64
+            )))
+        );
+    }
+}
+
+#[cfg(test)]
+mod icon_tests {
+    /// A 1×1 PNG of `color_type` (6 RGBA, 3 palette with an opaque `PLTE`), written by hand (no
+    /// encoder in this crate's tests).
+    fn one_pixel_png(color_type: u8) -> Vec<u8> {
+        fn chunk(out: &mut Vec<u8>, kind: &[u8], data: &[u8]) {
+            out.extend((data.len() as u32).to_be_bytes());
+            let start = out.len();
+            out.extend(kind);
+            out.extend(data);
+            out.extend(crc32(&out[start..]).to_be_bytes());
+        }
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut c = !0u32;
+            for &b in bytes {
+                c ^= u32::from(b);
+                for _ in 0..8 {
+                    c = if c & 1 != 0 {
+                        0xEDB8_8320 ^ (c >> 1)
+                    } else {
+                        c >> 1
+                    };
+                }
+            }
+            !c
+        }
+        // zlib stored block of one row: filter 0 and the pixel
+        let raw: &[u8] = if color_type == 3 {
+            &[0, 0]
+        } else {
+            &[0, 0x12, 0x34, 0x56, 0xFF]
+        };
+        let len = raw.len() as u8;
+        let mut z = vec![0x78, 0x01, 0x01, len, 0, !len, 0xFF];
+        z.extend(raw);
+        let (mut a, mut b) = (1u32, 0u32);
+        for &x in raw {
+            a = (a + u32::from(x)) % 65521;
+            b = (b + a) % 65521;
+        }
+        z.extend(((b << 16) | a).to_be_bytes());
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        chunk(
+            &mut out,
+            b"IHDR",
+            &[0, 0, 0, 1, 0, 0, 0, 1, 8, color_type, 0, 0, 0],
+        );
+        if color_type == 3 {
+            chunk(&mut out, b"PLTE", &[0x12, 0x34, 0x56]);
+        }
+        chunk(&mut out, b"IDAT", &z);
+        chunk(&mut out, b"IEND", &[]);
+        out
+    }
+
+    #[test]
+    fn an_icon_decodes_from_a_png_and_not_from_anything_else() {
+        assert!(super::decode_icon(&one_pixel_png(6)).is_some());
+        assert!(super::decode_icon(&one_pixel_png(3)).is_some());
+        assert!(super::decode_icon(b"not a png").is_none());
     }
 }

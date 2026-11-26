@@ -1,6 +1,6 @@
 //! Behaviour tables built once from the pinned client resources.
 use super::{
-    Behaviours, GameplayStateSource,
+    Behaviours, GameplayStateSource, HotTags,
     classes::{Class, ClassSet, Interface},
     states::{BlockId, PropKey, StateTable},
 };
@@ -49,7 +49,7 @@ pub enum PushReaction {
     IgnoreEntity,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct StateFacts {
     pub flags: u32,
     /// isFaceSturdy bits: support type (FULL, CENTER, RIGID) * 6 + direction.
@@ -61,7 +61,9 @@ pub struct StateFacts {
     pub emission: u8,
     pub dampening: u8,
     pub hardness: f32,
+    /// Original properties reaction, retained when a reload removes an override.
     pub push: PushReaction,
+    pub(crate) resolved_push: super::piston_reactions::CachedReaction,
     pub instrument: u8,
     /// Index into `Behaviours::shapes`, or -1 for an uncached (dynamic) shape.
     pub shape: i32,
@@ -203,6 +205,10 @@ pub struct BlockData {
     pub feature: Option<Arc<str>>,
     pub grow_probability: f64,
     pub growth_direction: Direction,
+    /// Declared head/body pair for a custom growing-plant family.
+    pub growing_plant_head: Option<BlockId>,
+    pub growing_plant_body: Option<BlockId>,
+    pub growing_plant_kelp: bool,
     pub schedule_fluid_ticks: bool,
     pub weather: u8,
     pub ignite_odds: i32,
@@ -418,9 +424,6 @@ tags! {
     sand = "sand",
     ice = "ice",
     snow = "snow",
-    infiniburn_overworld = "infiniburn_overworld",
-    infiniburn_nether = "infiniburn_nether",
-    infiniburn_end = "infiniburn_end",
     soul_fire_base_blocks = "soul_fire_base_blocks",
     washed_away_by_fluids = "washed_away_by_fluids",
     blocks_fluid_flow = "blocks_fluid_flow",
@@ -731,6 +734,8 @@ fn build_with_gameplay<G: GameplayStateSource>(
         return Err(fail("fluid registry order differs from Horizon's"));
     }
 
+    let fluid_state_definitions = crate::fluid_definitions::load(behaviour, &fluids)?;
+
     // Tags.
     let bundle = read_json(&root.join("block-tags.json"))?;
     let mut definitions = TagDefinitions::default();
@@ -761,6 +766,7 @@ fn build_with_gameplay<G: GameplayStateSource>(
         all_tags.insert(name.clone(), Arc::new(set));
     }
     let tags = Tags::resolve(&all_tags);
+    let hot_tags = HotTags::resolve(&all_tags);
     let tag = |name: &str| -> Option<Arc<BlockSet>> {
         all_tags
             .get(name.strip_prefix('#').unwrap_or(name))
@@ -809,7 +815,7 @@ fn build_with_gameplay<G: GameplayStateSource>(
             .map_err(|e| invalid(e.to_string()))?;
     }
     let fluid_built = fluid_definitions
-        .build(|name, _| FluidKind::from_name(name).map(|kind| kind as u8))
+        .build(|name, _| FluidKind::from_name(name).and_then(FluidKind::vanilla_index))
         .map_err(|e| invalid(e.to_string()))?;
     let fluid_mask = |name: &str| -> u8 {
         fluid_built
@@ -863,7 +869,21 @@ fn build_with_gameplay<G: GameplayStateSource>(
             int(3) as u8,
             row.get(4).and_then(Value::as_bool).unwrap_or(false),
         );
+        let fluid = registry
+            .state(BlockStateId(id as u32))
+            .map(crate::fluid::mod_fluid_of_block)
+            .transpose()?
+            .flatten()
+            .unwrap_or(fluid);
+        let push = match game.text("push") {
+            "PUSH" => PushReaction::Push,
+            "POPPED" => PushReaction::Popped,
+            "IMMOVEABLE" => PushReaction::Immoveable,
+            "IGNORE_ENTITY" => PushReaction::IgnoreEntity,
+            _ => PushReaction::PushPull,
+        };
         facts.push(StateFacts {
+            resolved_push: super::piston_reactions::CachedReaction::new(push),
             flags,
             sturdy: int(0) as u32,
             weak: int(5) as u32,
@@ -872,13 +892,7 @@ fn build_with_gameplay<G: GameplayStateSource>(
             emission: game.unsigned("emission") as u8,
             dampening: game.unsigned("dampening") as u8,
             hardness: game.number("hardness") as f32,
-            push: match game.text("push") {
-                "PUSH" => PushReaction::Push,
-                "POPPED" => PushReaction::Popped,
-                "IMMOVEABLE" => PushReaction::Immoveable,
-                "IGNORE_ENTITY" => PushReaction::IgnoreEntity,
-                _ => PushReaction::PushPull,
-            },
+            push,
             instrument: instrument_index(row.get(8).and_then(Value::as_str).unwrap_or("HARP")),
             shape: shape_ids[id],
         });
@@ -980,9 +994,14 @@ fn build_with_gameplay<G: GameplayStateSource>(
             })
             .map(|s| interned(&mut strings, s));
         let growth_direction = match field("growthDirection").and_then(Value::as_str) {
-            Some("DOWN") => Direction::Down,
+            Some("DOWN" | "down") => Direction::Down,
             _ => Direction::Up,
         };
+        let growing_plant_head = block_field("growingPlantHead");
+        let growing_plant_body = block_field("growingPlantBody");
+        let growing_plant_kelp = field("growingPlantKelp")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let default = table.default_state(block);
         let sound = &gameplay_states[default.0 as usize];
         let sounds = Arc::new(Sounds {
@@ -1015,6 +1034,9 @@ fn build_with_gameplay<G: GameplayStateSource>(
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0),
             growth_direction,
+            growing_plant_head,
+            growing_plant_body,
+            growing_plant_kelp,
             schedule_fluid_ticks: field("scheduleFluidTicks")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
@@ -1116,10 +1138,12 @@ fn build_with_gameplay<G: GameplayStateSource>(
         named,
         tags,
         all_tags,
+        hot_tags,
         facts,
         shapes,
         shape_info,
         fluid_tags,
+        fluid_definitions: fluid_state_definitions,
         blocks,
         items,
         potted_by_content,
@@ -1127,6 +1151,7 @@ fn build_with_gameplay<G: GameplayStateSource>(
         dynamic,
         occlusion_cache: Default::default(),
         growth: Default::default(),
+        block_maps: Default::default(),
     })
 }
 

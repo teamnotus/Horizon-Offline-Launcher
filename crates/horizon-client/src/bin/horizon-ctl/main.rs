@@ -142,6 +142,11 @@ pub struct Session {
     /// `--api LINE`: the protocol line this run speaks; a game on another line is refused.
     pub api: Option<String>,
     client: Option<Client>,
+    /// `mcp --paced`: the world stands still between tool calls (`mcp::Session::call`).
+    pub paced: bool,
+    /// The pause menu `--paced` opened, which the next action closes.
+    pub(crate) held: bool,
+    exporting: bool,
 }
 
 impl Session {
@@ -152,6 +157,9 @@ impl Session {
             home: horizon_client::logging::game_home(),
             api: None,
             client: None,
+            paced: false,
+            held: false,
+            exporting: false,
         }
     }
     /// A failure while No AI is on: every command refuses (help aside).
@@ -176,6 +184,11 @@ impl Session {
             self.client = None;
         }
         let reply = result?;
+        if line.starts_with("export ")
+            && let Some(active) = reply["active"].as_bool()
+        {
+            self.exporting = active;
+        }
         if reply.get("error").is_some() {
             return Err(Failure {
                 reply,
@@ -183,6 +196,124 @@ impl Session {
             });
         }
         Ok(reply)
+    }
+
+    /// `hunt ID`: walk up to a mob and hit it until it is gone, at most `timeout` seconds.
+    fn hunt(&mut self, id: i64, timeout: Duration) -> Result<Value, Failure> {
+        let deadline = Instant::now() + timeout;
+        let before = self.game("inventory")?;
+        let (mut hits, mut seen) = (0, Value::Null);
+        loop {
+            let near = self.game("entities 48")?;
+            let Some(mob) = find_entity(&near, id) else {
+                break;
+            };
+            if mob["health"].as_f64().is_some_and(|h| h <= 0.0) {
+                // Dying: it vanishes after its death animation.
+                seen = mob;
+                break;
+            }
+            if Instant::now() > deadline {
+                return Err(Failure {
+                    reply: json!({
+                        "error": format!("entity {id} still alive after {} s", timeout.as_secs_f64()),
+                        "kind": "timeout",
+                        "hits": hits,
+                        "entity": mob,
+                    }),
+                    status: GAME_ERROR,
+                });
+            }
+            seen = mob.clone();
+            let pos = &mob["pos"];
+            if mob["distance"].as_f64().unwrap_or(f64::MAX) > 2.5 {
+                // A path may not exist (water, a fence); try again from wherever this ends.
+                let _ = self.game(&format!(
+                    "goto {} {} {} --near 1.5 --sprint --timeout 3",
+                    pos[0], pos[1], pos[2]
+                ));
+                continue;
+            }
+            if self.game(&format!("attack {id}")).is_ok() {
+                hits += 1;
+                // Let the weapon recharge (a sword needs about 12 ticks).
+                self.game("wait 12")?;
+            } else {
+                let _ = self.game(&format!(
+                    "goto {} {} {} --near 0.8 --timeout 2",
+                    pos[0], pos[1], pos[2]
+                ));
+            }
+        }
+        // Walk over the drops so they are picked up.
+        if let Some(pos) = seen["pos"].as_array() {
+            let _ = self.game(&format!(
+                "goto {} {} {} --near 0.5 --timeout 4",
+                pos[0], pos[1], pos[2]
+            ));
+            self.game("wait 10")?;
+        }
+        let after = self.game("inventory")?;
+        Ok(json!({
+            "ok": true,
+            "gone": true,
+            "hits": hits,
+            "last_seen": seen,
+            "inventory_change": count_change(&before["counts"], &after["counts"]),
+        }))
+    }
+
+    /// `collect [RADIUS]`: walk over every dropped item within RADIUS, nearest first.
+    fn collect(&mut self, radius: f64) -> Result<Value, Failure> {
+        let before = self.game("inventory")?;
+        // Only the newest sequence number: events after it are this walk's.
+        let mut seq = self.game("events --since 18446744073709551615")?["last"]
+            .as_u64()
+            .unwrap_or_default();
+        let mut tried = Vec::new();
+        let mut left = Vec::new();
+        // Each item is tried once; one that stays put after a walk is out of reach.
+        while let Some(item) = nearest_item(&self.game(&format!("entities {radius}"))?, &tried) {
+            let id = item["id"].as_i64().unwrap_or_default();
+            tried.push(id);
+            let pos = &item["pos"];
+            let walk = self.game(&format!(
+                "goto {} {} {} --near 0.4 --timeout 4",
+                pos[0], pos[1], pos[2]
+            ));
+            self.game("wait 4")?;
+            let near = self.game(&format!("entities {radius}"))?;
+            if let Some(mut still) = find_entity(&near, id) {
+                if let Err(e) = walk {
+                    still["why"] = e.reply["error"].clone();
+                }
+                left.push(still);
+            }
+            // Stop when something hurts the player: walking on into a mob,
+            // a creeper or lava kills an agent that only reads the reply.
+            let events = self.game(&format!("events --since {seq}"))?;
+            seq = events["last"].as_u64().unwrap_or(seq);
+            let hurt = hurts(&events);
+            if !hurt.is_empty() {
+                let after = self.game("inventory")?;
+                return Err(Failure {
+                    reply: json!({
+                        "error": "stopped: the player was hurt",
+                        "kind": "hurt",
+                        "hurt": hurt,
+                        "inventory_change": count_change(&before["counts"], &after["counts"]),
+                        "left": left,
+                    }),
+                    status: GAME_ERROR,
+                });
+            }
+        }
+        let after = self.game("inventory")?;
+        Ok(json!({
+            "ok": true,
+            "inventory_change": count_change(&before["counts"], &after["counts"]),
+            "left": left,
+        }))
     }
 
     /// Run one command (CLI words); Ok(reply) or a failure.
@@ -196,18 +327,20 @@ impl Session {
                 "use horizon-ctl COMMAND --help outside scripts",
             ));
         }
-        let number = |i: usize, what: &str| -> Result<f64, Failure> {
-            words
+        let number = |i: usize, what: &str| -> Result<Duration, Failure> {
+            let text = words
                 .get(i)
-                .ok_or_else(|| Failure::usage(format!("missing {what}; usage: {}", usage(name))))?
-                .parse::<f64>()
-                .map_err(|_| {
-                    Failure::usage(format!("{what} must be a number; usage: {}", usage(name)))
-                })
+                .ok_or_else(|| Failure::usage(format!("missing {what}; usage: {}", usage(name))))?;
+            parse_seconds(text).ok_or_else(|| {
+                Failure::usage(format!(
+                    "{what} must be a number of seconds, at most {MAX_SECONDS}; usage: {}",
+                    usage(name)
+                ))
+            })
         };
         match name {
             "sleep" => {
-                thread::sleep(Duration::from_secs_f64(number(1, "SECONDS")?.max(0.0)));
+                thread::sleep(number(1, "SECONDS")?);
                 Ok(json!({ "ok": true }))
             }
             "launch" => {
@@ -224,7 +357,7 @@ impl Session {
                 if !wait {
                     return Ok(reply);
                 }
-                let mut ready = self.wait_ready(300.0)?;
+                let mut ready = self.wait_ready(Duration::from_secs(300))?;
                 ready["launch"] = reply;
                 Ok(ready)
             }
@@ -233,20 +366,52 @@ impl Session {
                     [_, id] if id.parse::<i64>().is_ok() => id,
                     _ => return Err(Failure::usage(format!("usage: {}", usage(name)))),
                 };
-                self.game(&format!("look-at entity {id}"))?;
+                let id: i64 = id.parse().unwrap_or_default();
+                let look = self.game(&format!("look-at entity {id}"))?;
+                if let Err(error) = aimed_at(&look, id) {
+                    return Err(Failure {
+                        reply: json!({ "error": error, "target": look["target"] }),
+                        status: GAME_ERROR,
+                    });
+                }
+                let before = self.game("inventory")?;
                 self.game("mouse right click")?;
                 self.game("wait 2")?;
+                let after = self.game("inventory")?;
                 let mut screen = self.game("screen")?;
                 screen["ok"] = json!(true);
+                screen["inventory_change"] = count_change(&before["counts"], &after["counts"]);
                 Ok(screen)
             }
+            "hunt" => {
+                let (id, timeout) = match words {
+                    [_, id] => (id.parse::<i64>().ok(), Some(Duration::from_secs(30))),
+                    [_, id, flag, s] if flag == "--timeout" => {
+                        (id.parse::<i64>().ok(), parse_seconds(s))
+                    }
+                    _ => (None, None),
+                };
+                let (Some(id), Some(timeout)) = (id, timeout) else {
+                    return Err(Failure::usage(format!("usage: {}", usage(name))));
+                };
+                self.hunt(id, timeout)
+            }
+            "collect" => match words {
+                [_] => self.collect(8.0),
+                [_, r] if r.parse::<f64>().is_ok_and(|r| r > 0.0) => {
+                    self.collect(r.parse().unwrap_or(8.0))
+                }
+                _ => Err(Failure::usage(format!("usage: {}", usage(name)))),
+            },
             "hold" => {
                 let (key, seconds) = match words {
                     [_, key, _] => (key.clone(), number(2, "SECONDS")?),
                     _ => return Err(Failure::usage(format!("usage: {}", usage(name)))),
                 };
+                // The duration is checked before the key goes down: a refusal
+                // later would leave it pressed.
                 self.game(&format!("key {key} down"))?;
-                thread::sleep(Duration::from_secs_f64(seconds.max(0.0)));
+                thread::sleep(seconds);
                 self.game(&format!("key {key} up"))
             }
             "logs" => logs(&self.home, &words[1..]),
@@ -254,7 +419,7 @@ impl Session {
                 let limit = if words.len() > 1 {
                     number(1, "SECONDS")?
                 } else {
-                    120.0
+                    Duration::from_secs(120)
                 };
                 self.wait_ready(limit)
             }
@@ -277,27 +442,126 @@ impl Session {
         }
     }
 
-    fn wait_ready(&mut self, limit: f64) -> Result<Value, Failure> {
-        let deadline = Instant::now() + Duration::from_secs_f64(limit.max(0.0));
+    fn wait_ready(&mut self, limit: Duration) -> Result<Value, Failure> {
+        let deadline = Instant::now() + limit;
         loop {
             let status = self.game("status")?;
-            // On a server (single player's server thread too), also the
-            // level around the player.
-            if !status["player"].is_null()
-                && status["pending_chunks"] == 0
-                && status["server"]["loaded"] != false
-            {
+            if world_ready(&status) {
                 return Ok(status);
             }
             if Instant::now() > deadline {
                 return Err(Failure {
-                    reply: json!({ "error": format!("not ready after {limit} seconds"), "status": status }),
+                    reply: json!({ "error": format!("not ready after {} seconds", limit.as_secs_f64()), "status": status }),
                     status: GAME_ERROR,
                 });
             }
             thread::sleep(Duration::from_millis(250));
         }
     }
+}
+
+/// The longest wait a command takes, in seconds (a year): `Duration` can't hold
+/// every `f64` a number parses to (`inf`, `1e30`), and a longer wait is a typo.
+const MAX_SECONDS: u64 = 365 * 24 * 3600;
+
+/// `text` as a wait: a number of seconds (below 0 counts as 0), or None when it
+/// isn't a finite number of at most `MAX_SECONDS`.
+fn parse_seconds(text: &str) -> Option<Duration> {
+    // NaN and -inf would pass `max(0.0)` as 0, so they are refused first.
+    let seconds = text.parse::<f64>().ok().filter(|s| s.is_finite())?;
+    Duration::try_from_secs_f64(seconds.max(0.0))
+        .ok()
+        .filter(|d| d.as_secs() <= MAX_SECONDS)
+}
+
+/// Whether `status` says a world has arrived: the player is in it, no chunk
+/// work waits here (`pending_chunks`), it holds the columns its render
+/// distance's view has (`view_chunks`), and the terrain has settled
+/// (`terrain_loading`: the view's outermost columns, generation, meshes,
+/// uploads or the server's backlog). A server sends a view's columns nearest
+/// first, so `pending_chunks` alone reads 0 while most of them are unsent.
+fn world_ready(status: &Value) -> bool {
+    !status["player"].is_null()
+        && status["pending_chunks"] == 0
+        && status["server"]["loaded"] != false
+        && !status["terrain_loading"].as_bool().unwrap_or(false)
+        && status["chunks"].as_u64().unwrap_or(0)
+            >= horizon_client::benchmark::view_chunks(
+                status["render_distance"].as_u64().unwrap_or(0),
+            )
+}
+
+/// Whether `look` (a `look-at entity` reply) put entity `id` under the crosshair; if not,
+/// what is there instead, so a right click is not spent on a tree or the air.
+fn aimed_at(look: &Value, id: i64) -> Result<(), String> {
+    let target = &look["target"];
+    let entity = &target["entity"];
+    if entity["id"].as_i64() == Some(id) {
+        return Ok(());
+    }
+    Err(if let Some(other) = entity["id"].as_i64() {
+        format!(
+            "entity {id} is not under the crosshair: {} {other} is in the way",
+            entity["type"].as_str().unwrap_or("an entity")
+        )
+    } else if let Some(block) = target["block"]["block"].as_str() {
+        format!(
+            "entity {id} is not under the crosshair: {block} at {} is in the way",
+            target["block"]["pos"]
+        )
+    } else {
+        format!("entity {id} is not under the crosshair: it is out of reach or moved; walk closer")
+    })
+}
+
+/// The entity `id` in an `entities` reply.
+fn find_entity(reply: &Value, id: i64) -> Option<Value> {
+    reply["entities"]
+        .as_array()?
+        .iter()
+        .find(|e| e["id"].as_i64() == Some(id))
+        .cloned()
+}
+
+/// The nearest dropped item in an `entities` reply (nearest first) whose id is not in `skip`.
+fn nearest_item(reply: &Value, skip: &[i64]) -> Option<Value> {
+    reply["entities"]
+        .as_array()?
+        .iter()
+        .find(|e| e["kind"] == "item" && !e["id"].as_i64().is_some_and(|id| skip.contains(&id)))
+        .cloned()
+}
+
+/// The `hurt` events in an `events` reply.
+fn hurts(reply: &Value) -> Vec<Value> {
+    let events = reply["events"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    events
+        .iter()
+        .filter(|e| e["event"] == "hurt")
+        .cloned()
+        .collect()
+}
+
+/// Item counts that changed from `before` to `after` (`inventory` replies' `counts`).
+fn count_change(before: &Value, after: &Value) -> Value {
+    let empty = serde_json::Map::new();
+    let (before, after) = (
+        before.as_object().unwrap_or(&empty),
+        after.as_object().unwrap_or(&empty),
+    );
+    let mut change = serde_json::Map::new();
+    for item in before.keys().chain(after.keys()) {
+        let n =
+            |m: &serde_json::Map<String, Value>| m.get(item).and_then(Value::as_i64).unwrap_or(0);
+        let delta = n(after) - n(before);
+        if delta != 0 {
+            change.insert(item.clone(), json!(delta));
+        }
+    }
+    Value::Object(change)
 }
 
 /// `logs [--lines N] [--crash]` for the game in `home`: the reply's `text` is the log's last
@@ -478,14 +742,14 @@ fn main() -> ExitCode {
                 args.remove(0);
             }
             Some("--timeout") if args.len() >= 2 => {
-                let Ok(s) = args[1].parse::<f64>() else {
+                let Some(s) = parse_seconds(&args[1]) else {
                     print(
-                        &json!({ "error": "--timeout takes seconds", "kind": "usage" }),
+                        &json!({ "error": format!("--timeout takes seconds, at most {MAX_SECONDS}"), "kind": "usage" }),
                         false,
                     );
                     return ExitCode::from(USAGE);
                 };
-                timeout = Some(Duration::from_secs_f64(s.max(0.001)));
+                timeout = Some(s.max(Duration::from_millis(1)));
                 args.drain(0..2);
             }
             Some("--api") if args.len() >= 2 => {
@@ -563,13 +827,16 @@ fn main() -> ExitCode {
             eprintln!("horizon-ctl mcp: {}", horizon_core::no_ai::REFUSAL);
             DENIED
         }
-        Some("mcp") => match mcp::serve(&mut session) {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("horizon-ctl mcp: {e}");
-                UNREACHABLE
+        Some("mcp") => {
+            session.paced = args[1..].iter().any(|a| a == "--paced");
+            match mcp::serve(&mut session) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("horizon-ctl mcp: {e}");
+                    UNREACHABLE
+                }
             }
-        },
+        }
         // The original form: stdin, keep going after errors.
         Some("-") => script(&mut session, std::io::stdin().lock(), true, pretty),
         Some("script") => {
@@ -618,6 +885,111 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wait_ready_waits_for_the_view_s_chunks_and_terrain_to_settle() {
+        let status = |chunks: u64, pending: u64, loading: bool| {
+            json!({
+                "player": {"position": [0.0, 64.0, 0.0]},
+                "pending_chunks": pending,
+                "server": {"loaded": true},
+                "render_distance": 12,
+                "chunks": chunks,
+                "terrain_loading": loading,
+            })
+        };
+        // A brand-new world: nothing is queued here yet, the server is still
+        // sending the view (76 of 3725 columns in the issue's runs).
+        assert!(!world_ready(&status(0, 0, false)));
+        assert!(
+            !world_ready(&status(360, 0, false)),
+            "below view_chunks(12)"
+        );
+        // The view's columns are in, but their meshes and uploads are not.
+        assert!(!world_ready(&status(400, 0, true)));
+        assert!(!world_ready(&status(400, 1, false)));
+        // Nothing is left: the world is ready.
+        assert!(world_ready(&status(400, 0, false)));
+        // A game before `terrain_loading` existed is judged by its columns and queue.
+        let mut old = status(400, 0, false);
+        old.as_object_mut().unwrap().remove("terrain_loading");
+        assert!(world_ready(&old));
+        // No player, or a player the server has not loaded, is not ready.
+        assert!(!world_ready(&json!({
+            "pending_chunks": 0, "chunks": 400, "render_distance": 12, "server": {"loaded": true},
+        })));
+        let mut unloaded = status(400, 0, false);
+        unloaded["server"]["loaded"] = json!(false);
+        assert!(!world_ready(&unloaded));
+    }
+
+    #[test]
+    fn aimed_at_names_what_is_under_the_crosshair_instead() {
+        let on = json!({ "target": { "entity": { "id": 91, "type": "minecraft:sheep" } } });
+        assert_eq!(aimed_at(&on, 91), Ok(()));
+        let sheep = aimed_at(&on, 107).unwrap_err();
+        assert!(
+            sheep.contains("minecraft:sheep 91 is in the way"),
+            "{sheep}"
+        );
+        let log = json!({
+            "target": { "block": { "block": "minecraft:oak_log", "pos": [1, 2, 3] } }
+        });
+        let log = aimed_at(&log, 91).unwrap_err();
+        assert!(
+            log.contains("minecraft:oak_log at [1,2,3] is in the way"),
+            "{log}"
+        );
+        let nothing = aimed_at(&json!({ "target": null }), 91).unwrap_err();
+        assert!(nothing.contains("walk closer"), "{nothing}");
+    }
+
+    #[test]
+    fn find_entity_picks_the_id_out_of_an_entities_reply() {
+        let near = json!({ "entities": [{ "id": 3 }, { "id": 90, "type": "minecraft:chicken" }] });
+        assert_eq!(find_entity(&near, 90).unwrap()["type"], "minecraft:chicken");
+        assert!(find_entity(&near, 7).is_none());
+        assert!(find_entity(&json!({}), 90).is_none());
+    }
+
+    #[test]
+    fn hurts_keeps_only_hurt_events() {
+        let reply = json!({ "events": [
+            { "event": "item", "seq": 1 },
+            { "event": "hurt", "amount": 3.0, "seq": 2 },
+            { "event": "heal", "seq": 3 },
+        ], "last": 3 });
+        assert_eq!(
+            hurts(&reply),
+            vec![json!({ "event": "hurt", "amount": 3.0, "seq": 2 })]
+        );
+        assert!(hurts(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn nearest_item_skips_mobs_and_items_already_tried() {
+        let near = json!({ "entities": [
+            { "id": 1, "kind": "mob" },
+            { "id": 2, "kind": "item" },
+            { "id": 3, "kind": "item" },
+        ] });
+        assert_eq!(nearest_item(&near, &[]).unwrap()["id"], 2);
+        assert_eq!(nearest_item(&near, &[2]).unwrap()["id"], 3);
+        assert!(nearest_item(&near, &[2, 3]).is_none());
+    }
+
+    #[test]
+    fn count_change_keeps_only_items_whose_count_moved() {
+        let before = json!({ "minecraft:shears": 1, "minecraft:white_wool": 1 });
+        let after = json!({
+            "minecraft:shears": 1, "minecraft:white_wool": 3, "minecraft:stick": 2
+        });
+        assert_eq!(
+            count_change(&before, &after),
+            json!({ "minecraft:white_wool": 2, "minecraft:stick": 2 })
+        );
+        assert_eq!(count_change(&after, &before)["minecraft:stick"], json!(-2));
+    }
+
+    #[test]
     fn logs_reads_the_end_of_latest_log_and_the_newest_crash_report() {
         let home = std::env::temp_dir().join(format!("horizon-ctl-logs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
@@ -664,6 +1036,36 @@ mod tests {
     }
 
     #[test]
+    fn seconds_are_finite_and_bounded() {
+        assert_eq!(parse_seconds("1.5"), Some(Duration::from_millis(1500)));
+        assert_eq!(parse_seconds("-3"), Some(Duration::ZERO));
+        for bad in ["inf", "-inf", "NaN", "1e30", "31536001", "x", ""] {
+            assert_eq!(parse_seconds(bad), None, "{bad}");
+        }
+    }
+
+    /// A bad duration is a usage error before any key goes down: the key would stay pressed.
+    #[cfg(unix)]
+    #[test]
+    fn hold_with_a_bad_duration_presses_no_key() {
+        let (path, game) = fake_game("hold-bad", r#"{"ok":true}"#);
+        let home = std::env::temp_dir().join(format!("horizon-ctl-hold-{}", std::process::id()));
+        let mut s = Session::new(path.clone(), Some(Duration::from_secs(5)));
+        s.home = home;
+        for bad in ["inf", "1e30"] {
+            let f = s
+                .run(&["hold".to_owned(), "w".to_owned(), bad.to_owned()])
+                .unwrap_err();
+            assert_eq!(f.status, USAGE, "{bad}");
+        }
+        drop(s);
+        // The fake game waits for a connection; give it one so it can report what it got.
+        drop(std::os::unix::net::UnixStream::connect(&path).unwrap());
+        assert!(game.join().unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn script_lines_split_like_a_shell() {
         assert_eq!(
             split_line("goto 1 2 3 --near 2").unwrap(),
@@ -689,6 +1091,14 @@ mod tests {
         name: &str,
         reply: &'static str,
     ) -> (PathBuf, std::thread::JoinHandle<Vec<String>>) {
+        fake_game_with(name, move |_| reply)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn fake_game_with(
+        name: &str,
+        reply: impl Fn(&str) -> &'static str + Send + 'static,
+    ) -> (PathBuf, std::thread::JoinHandle<Vec<String>>) {
         let path = std::env::temp_dir().join(format!("hctl-{name}-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
@@ -699,9 +1109,10 @@ mod tests {
             let mut out = stream;
             let mut line = String::new();
             while reader.read_line(&mut line).unwrap_or(0) > 0 {
-                lines.push(line.trim_end().to_owned());
+                let command = line.trim_end();
+                writeln!(out, "{}", reply(command)).unwrap();
+                lines.push(command.to_owned());
                 line.clear();
-                writeln!(out, "{reply}").unwrap();
             }
             lines
         });

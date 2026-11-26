@@ -13,7 +13,13 @@ pub enum Cursor {
     #[default]
     Arrow,
     PointingHand,
+    /// `CursorTypes.IBEAM`: over a text field that takes input.
+    Ibeam,
     NotAllowed,
+    /// `CursorTypes.RESIZE_NS`: a scroller held vertically (`MerchantScreen`).
+    ResizeNs,
+    /// `CursorTypes.RESIZE_EW`: a slider held horizontally.
+    ResizeEw,
 }
 
 thread_local! {
@@ -37,6 +43,31 @@ pub fn widget_cursor(hovered: bool, active: bool) {
         });
     }
 }
+/// `AbstractSliderButton.handleCursor`: a dragged slider resizes, a hovered
+/// one points, and an inactive one is not allowed.
+pub fn slider_cursor(hovered: bool, active: bool, dragging: bool) {
+    if hovered {
+        request_cursor(if !active {
+            Cursor::NotAllowed
+        } else if dragging {
+            Cursor::ResizeEw
+        } else {
+            Cursor::PointingHand
+        });
+    }
+}
+
+/// `EditBox.handleCursor`: a hovered text field shows the I-beam, or the
+/// forbidden sign when it takes no input.
+pub fn text_cursor(hovered: bool, editable: bool) {
+    if hovered {
+        request_cursor(if editable {
+            Cursor::Ibeam
+        } else {
+            Cursor::NotAllowed
+        });
+    }
+}
 
 /// The cursor the frame asked for, and back to the arrow for the next one
 /// (the window shows the arrow unless a widget asks).
@@ -47,6 +78,8 @@ pub fn take_cursor() -> Cursor {
 /// A labelled widget in GUI pixels (the coordinates screens take input in).
 #[derive(Clone, Debug)]
 pub struct Widget {
+    /// The screen's registered control id, independent of the drawn label.
+    pub id: Option<&'static str>,
     pub label: String,
     pub x: f32,
     pub y: f32,
@@ -105,6 +138,11 @@ thread_local! {
     static ACTION_SCREENS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
     /// The lists drawn with a scrollbar since `end_frame`, and the last frame's.
     static SCROLL_AREAS: RefCell<(Vec<ScrollArea>, Vec<ScrollArea>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+    /// The steps screens declared since `end_frame` ([`focus_link`]), and the last frame's.
+    static FOCUS_LINKS: RefCell<(Vec<FocusLink>, Vec<FocusLink>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+    /// The targets whose value left and right step ([`steps_value`]) since `end_frame`, and the
+    /// last frame's.
+    static STEPPERS: RefCell<(Vec<[f32; 4]>, Vec<[f32; 4]>)> = const { RefCell::new((Vec::new(), Vec::new())) };
 }
 
 /// Splitscreen: one player's buttons and focus targets, kept aside while another player's game
@@ -117,6 +155,8 @@ pub struct Saved(
     bool,
     (u64, u64),
     (Vec<ScrollArea>, Vec<ScrollArea>),
+    (Vec<FocusLink>, Vec<FocusLink>),
+    (Vec<[f32; 4]>, Vec<[f32; 4]>),
 );
 
 /// This thread's buttons and targets, leaving none.
@@ -128,6 +168,8 @@ pub fn take() -> Saved {
         ACTION_GLYPHS.take(),
         ACTION_SCREENS.take(),
         SCROLL_AREAS.take(),
+        FOCUS_LINKS.take(),
+        STEPPERS.take(),
     )
 }
 
@@ -136,6 +178,8 @@ pub fn put(saved: Saved) {
     WIDGETS.set(saved.0);
     TARGETS.set(saved.1);
     SCROLL_AREAS.set(saved.5);
+    FOCUS_LINKS.set(saved.6);
+    STEPPERS.set(saved.7);
     ACTIONS.set(saved.2);
     ACTION_GLYPHS.set(saved.3);
     ACTION_SCREENS.set(saved.4);
@@ -282,6 +326,8 @@ pub fn cover_frame() {
     TARGETS.with_borrow_mut(|(current, _, _)| current.clear());
     ACTIONS.with_borrow_mut(|(current, _)| current.clear());
     SCROLL_AREAS.with_borrow_mut(|(current, _)| current.clear());
+    FOCUS_LINKS.with_borrow_mut(|(current, _)| current.clear());
+    STEPPERS.with_borrow_mut(|(current, _)| current.clear());
 }
 
 /// This frame drew a list with something to scroll, in `rect`, scrolled `amount`
@@ -315,6 +361,50 @@ pub fn over_scroll_area(at: (f32, f32)) -> (f32, f32) {
     })
 }
 
+/// A step the arrows and the D-pad take that the rectangles don't show: `down` (else up) from
+/// a focus whose middle is in `from`, to the target at `to`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FocusLink {
+    pub from: [f32; 4],
+    pub down: bool,
+    pub to: [f32; 4],
+}
+
+/// Down (or up) from what is in `from` goes to `to`: a screen whose layout puts the next control
+/// off to one side, where vanilla's step would pass it by (the settings shell's search field over
+/// its list, on a screen with no page list).
+pub fn focus_link(from: [f32; 4], down: bool, to: [f32; 4]) {
+    FOCUS_LINKS.with_borrow_mut(|(current, _)| current.push(FocusLink { from, down, to }));
+}
+
+/// Where the last drawn frame said a step `down` (else up) from `focus` goes, if it said.
+pub fn linked_step(focus: [f32; 4], down: bool) -> Option<[f32; 4]> {
+    let [x, y, w, h] = focus;
+    let middle = (x + w / 2.0, y + h / 2.0);
+    FOCUS_LINKS.with_borrow(|(_, last)| {
+        last.iter()
+            .find(|l| {
+                let [lx, ly, lw, lh] = l.from;
+                l.down == down
+                    && (lx..lx + lw).contains(&middle.0)
+                    && (ly..ly + lh).contains(&middle.1)
+            })
+            .map(|l| l.to)
+    })
+}
+
+/// Left and right on the target at `rect` step its value, back and on, rather than move the focus
+/// (the settings shell's choices, whose `<` `>` say so): Right as a press, Left as a Shift press.
+pub fn steps_value(rect: [f32; 4]) {
+    STEPPERS.with_borrow_mut(|(current, _)| current.push(rect));
+}
+
+/// Whether the last drawn frame said left and right step the value of the target at `focus`.
+pub fn last_steps_value(focus: [f32; 4]) -> bool {
+    let same = |rect: &[f32; 4]| rect.iter().zip(focus).all(|(a, b)| (a - b).abs() < 0.5);
+    STEPPERS.with_borrow(|(_, last)| last.iter().any(same))
+}
+
 /// The focus targets of the last drawn frame.
 pub fn last_targets() -> Vec<Target> {
     TARGETS.with_borrow(|(_, last, _)| last.clone())
@@ -331,7 +421,19 @@ pub fn record(label: &str, rect: [f32; 4], enabled: bool) {
 }
 
 /// The label of a widget of another kind (a slider's "FOV: 70", a tab).
-pub fn record_as(label: &str, [x, y, w, h]: [f32; 4], enabled: bool, kind: Kind) {
+pub fn record_as(label: &str, rect: [f32; 4], enabled: bool, kind: Kind) {
+    record_with_id(None, label, rect, enabled, kind);
+}
+
+/// Register a control with an optional agent-facing id. The id must be
+/// unique on its screen; omit it for data such as a player-named world.
+pub fn record_with_id(
+    id: Option<&'static str>,
+    label: &str,
+    [x, y, w, h]: [f32; 4],
+    enabled: bool,
+    kind: Kind,
+) {
     let label = label.trim();
     if label.is_empty() {
         return;
@@ -339,6 +441,7 @@ pub fn record_as(label: &str, [x, y, w, h]: [f32; 4], enabled: bool, kind: Kind)
     WIDGETS.with_borrow_mut(|(current, _, _)| {
         if current.len() < 512 {
             current.push(Widget {
+                id,
                 label: label.to_owned(),
                 x,
                 y,
@@ -355,6 +458,28 @@ pub fn record_as(label: &str, [x, y, w, h]: [f32; 4], enabled: bool, kind: Kind)
 mod cursor_tests {
     use super::*;
 
+    #[test]
+    fn a_hovered_text_field_asks_for_the_i_beam() {
+        let _ = take_cursor();
+        text_cursor(false, true);
+        assert_eq!(take_cursor(), Cursor::Arrow);
+        text_cursor(true, true);
+        assert_eq!(take_cursor(), Cursor::Ibeam);
+        text_cursor(true, false);
+        assert_eq!(take_cursor(), Cursor::NotAllowed);
+    }
+    #[test]
+    fn a_dragged_slider_asks_for_the_horizontal_resize_cursor() {
+        let _ = take_cursor();
+        slider_cursor(false, true, true);
+        assert_eq!(take_cursor(), Cursor::Arrow);
+        slider_cursor(true, true, true);
+        assert_eq!(take_cursor(), Cursor::ResizeEw);
+        slider_cursor(true, true, false);
+        assert_eq!(take_cursor(), Cursor::PointingHand);
+        slider_cursor(true, false, true);
+        assert_eq!(take_cursor(), Cursor::NotAllowed);
+    }
     #[test]
     fn hovered_widgets_ask_for_the_hand_or_not_allowed() {
         let _ = take_cursor();
@@ -390,6 +515,12 @@ pub fn end_frame(frames: u64) {
             });
             ACTION_SCREENS.set((ACTION_SCREENS.get().0, ACTION_SCREENS.get().0));
             SCROLL_AREAS.with_borrow_mut(|(current, last)| {
+                *last = std::mem::take(current);
+            });
+            FOCUS_LINKS.with_borrow_mut(|(current, last)| {
+                *last = std::mem::take(current);
+            });
+            STEPPERS.with_borrow_mut(|(current, last)| {
                 *last = std::mem::take(current);
             });
             NARRATION.with_borrow_mut(|(current, last)| {
@@ -1144,8 +1275,8 @@ impl Kind {
 /// A widget of the `ui` tree: a labelled widget and its focus target merged.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Node {
-    /// The label as a slug up to its `:` (`FOV: 70` is `fov`), `-2`, `-3`
-    /// for repeats; `<kind>-<n>` in draw order without a label.
+    /// The registered control id, or the label as a slug up to its `:`
+    /// with `-2`, `-3` for repeats; `<kind>-<n>` for unlabelled targets.
     pub id: String,
     pub kind: Kind,
     pub label: Option<String>,
@@ -1177,7 +1308,7 @@ pub fn tree(widgets: &[Widget], targets: &[Target], screen: Option<[f32; 2]>) ->
     let mut nodes: Vec<Node> = widgets
         .iter()
         .map(|w| Node {
-            id: String::new(),
+            id: w.id.unwrap_or_default().to_owned(),
             kind: w.kind,
             label: Some(w.label.clone()),
             rect: [w.x, w.y, w.w, w.h],
@@ -1205,8 +1336,14 @@ pub fn tree(widgets: &[Widget], targets: &[Target], screen: Option<[f32; 2]>) ->
             x >= -0.5 && y >= -0.5 && x + nw <= w + 0.5 && y + nh <= h + 0.5
         });
     }
-    let mut seen = std::collections::HashMap::<String, usize>::new();
-    for node in &mut nodes {
+    // A data-driven label (e.g. a world named "Create New World") must not
+    // take a registered control's id even when that label was drawn first.
+    let mut seen: std::collections::HashMap<String, usize> = nodes
+        .iter()
+        .filter(|node| !node.id.is_empty())
+        .map(|node| (node.id.clone(), 1))
+        .collect();
+    for node in nodes.iter_mut().filter(|node| node.id.is_empty()) {
         let base = node
             .label
             .as_deref()
@@ -1260,6 +1397,7 @@ mod tests {
 
     fn w(label: &str) -> Widget {
         Widget {
+            id: None,
             label: label.into(),
             x: 0.0,
             y: 0.0,
@@ -1320,6 +1458,19 @@ mod tests {
         assert_eq!(slug("Music & Sounds..."), "music-sounds");
         assert_eq!(slug("Difficulty: Normal"), "difficulty");
         assert_eq!(slug("Économie"), "économie");
+    }
+
+    #[test]
+    fn registered_ids_take_precedence_over_data_labels() {
+        let mut world = w("Create New World");
+        world.kind = Kind::Row;
+        let mut create = w("Создать новый мир");
+        create.id = Some("create-new-world");
+        create.y = 30.0;
+        let nodes = tree(&[world, create], &[], None);
+        assert_eq!(nodes[0].id, "create-new-world-2");
+        assert_eq!(nodes[1].id, "create-new-world");
+        assert_eq!(nodes[1].label.as_deref(), Some("Создать новый мир"));
     }
 
     #[test]
