@@ -57,7 +57,8 @@ jobs:
           # also ships files the build needs, such as packaging/windows/exe.rs.
           git checkout origin/main -- packaging
           git checkout origin/main -- crates/horizon-release-sign/release-keys.txt \
-            README.md AGENTS.md install.ps1 install.sh build.ps1 docs/launcher-commands.md
+            README.md AGENTS.md install.ps1 install.sh build.ps1 docs/launcher-commands.md \
+            tools/ci/apt_install.sh tools/ci/nightly.py tools/ci/sign_release.sh
           # Upstream declares hooks in Rust now; a stale fork copy makes its build script fail.
           if git cat-file -e FETCH_HEAD:native-hooks.json 2>/dev/null; then
             git checkout origin/main -- native-hooks.json
