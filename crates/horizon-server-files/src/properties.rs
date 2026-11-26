@@ -2,14 +2,12 @@
 //! vanilla's default, parser and serializer. Reading a value writes its
 //! normalized form back, so storing afterwards rewrites the file the way the
 //! vanilla server does on start; the legacy keys are dropped.
-use super::{
-    java_properties::{Properties, date_string, now_millis},
-    json::{self, Json},
-};
+use super::json::{self, Json};
 use horizon_core::{
     random::java_string_hash,
-    text::{parse_java_integer, parse_java_long},
+    text::{parse_java_integer, parse_java_long, parse_java_uuid},
 };
+use horizon_java_properties::{Properties, date_string, now_millis};
 use horizon_protocol::crypto::md5;
 
 /// MinecraftServer.ServerResourcePackInfo.
@@ -110,17 +108,17 @@ pub const GAME_MODES: [&str; 4] = ["survival", "creative", "adventure", "spectat
 pub trait Entropy {
     /// RandomSource.create().nextLong() (WorldOptions.randomSeed).
     fn next_long(&mut self) -> i64;
-    /// SecureRandom.nextInt(bound).
+    /// The JDK's bounded random int.
     fn next_int(&mut self, bound: u32) -> u32;
 }
-/// Entropy from the operating system (/dev/urandom), else the clock.
+/// RandomSource.create(): a fast stream seeded once from the operating system (the clock only
+/// if that fails). Never for secrets: one output gives away the rest of the stream, and the world
+/// seed is one of them. Secrets use [`OsEntropy`].
 pub struct SystemEntropy(u64);
 impl Default for SystemEntropy {
     fn default() -> Self {
         let mut seed = [0u8; 8];
-        let ok = std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut seed))
-            .is_ok();
+        let ok = getrandom::fill(&mut seed).is_ok();
         let mut s = u64::from_le_bytes(seed);
         if !ok || s == 0 {
             s = now_millis() as u64 ^ 0x9E37_79B9_7F4A_7C15;
@@ -147,6 +145,34 @@ impl Entropy for SystemEntropy {
     }
 }
 
+/// SecureRandom: every draw straight from the operating system, for secrets (the management
+/// secret, the keystore password). Vanilla draws them from SecureRandom, never from the stream
+/// the world seed comes from: splitmix64's output is invertible, so a seed anyone can read
+/// (`/seed`, seed crackers) gave the secret's state back.
+pub struct OsEntropy;
+impl OsEntropy {
+    fn bytes<const N: usize>() -> [u8; N] {
+        let mut b = [0u8; N];
+        getrandom::fill(&mut b).expect("the operating system's random generator");
+        b
+    }
+}
+impl Entropy for OsEntropy {
+    fn next_long(&mut self) -> i64 {
+        i64::from_le_bytes(Self::bytes())
+    }
+    fn next_int(&mut self, bound: u32) -> u32 {
+        // Rejection sampling: no modulo bias.
+        let zone = u32::MAX - u32::MAX % bound;
+        loop {
+            let v = u32::from_le_bytes(Self::bytes());
+            if v < zone {
+                return v % bound;
+            }
+        }
+    }
+}
+
 /// SecurityConfig.generateSecretKey.
 pub fn generate_secret_key(entropy: &mut dyn Entropy) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -155,7 +181,7 @@ pub fn generate_secret_key(entropy: &mut dyn Entropy) -> String {
         .collect()
 }
 
-/// UUID.nameUUIDFromBytes.
+/// The JDK's name-based UUIDv3.
 pub fn name_uuid(bytes: &[u8]) -> u128 {
     let mut h = md5(bytes);
     h[6] = (h[6] & 0x0f) | 0x30;
@@ -163,25 +189,12 @@ pub fn name_uuid(bytes: &[u8]) -> u128 {
     u128::from_be_bytes(h)
 }
 
-/// UUID.fromString (the lenient JDK parser: five dash-separated hex groups).
+/// The JDK's lenient UUID parser (`UUID.fromString`): five dash-separated signed-long hex groups.
 pub fn parse_uuid(s: &str) -> Option<u128> {
-    let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 5 || s.len() > 36 {
-        return None;
-    }
-    let mut v = [0u64; 5];
-    for (i, p) in parts.iter().enumerate() {
-        if p.is_empty() || p.len() > 16 {
-            return None;
-        }
-        v[i] = u64::from_str_radix(p, 16).ok()?;
-    }
-    let msb = (v[0] & 0xffff_ffff) << 32 | (v[1] & 0xffff) << 16 | (v[2] & 0xffff);
-    let lsb = (v[3] & 0xffff) << 48 | (v[4] & 0xffff_ffff_ffff);
-    Some(u128::from(msb) << 64 | u128::from(lsb))
+    parse_java_uuid(s)
 }
 
-/// Boolean.valueOf.
+/// Java's `Boolean` parsing.
 fn java_bool(s: &str) -> bool {
     s.eq_ignore_ascii_case("true")
 }
@@ -235,12 +248,20 @@ impl Reader {
 }
 
 impl ServerProperties {
-    /// DedicatedServerProperties.fromFile; a file that cannot be read is an
-    /// empty set (Settings.loadFromFile logs and continues).
+    /// `DedicatedServerProperties.fromFile`; unlike vanilla's `Settings.loadFromFile`,
+    /// only a missing file is empty. Do not let callers store defaults over unreadable settings.
     pub fn from_file(path: &std::path::Path, entropy: &mut dyn Entropy) -> Result<Self, String> {
         let p = match std::fs::read(path) {
             Ok(bytes) => Properties::load_file(&bytes).map_err(|e| e.to_string())?,
-            Err(_) => Properties::default(),
+            // `read` also returns NotFound for a dangling link; renaming over it would lose it.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && std::fs::symlink_metadata(path)
+                        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Properties::default()
+            }
+            Err(e) => return Err(format!("Failed to read {}: {e}", path.display())),
         };
         Self::new(p, entropy)
     }
@@ -281,7 +302,8 @@ impl ServerProperties {
         let management_server_enabled = r.boolean("management-server-enabled", false);
         let management_server_host = r.string("management-server-host", "localhost");
         let management_server_port = r.int("management-server-port", 0);
-        let secret = generate_secret_key(entropy);
+        // SecurityConfig.generateSecretKey draws from SecureRandom, apart from the seed's stream.
+        let secret = generate_secret_key(&mut OsEntropy);
         let management_server_secret = r.string("management-server-secret", &secret);
         let management_server_tls_enabled = r.boolean("management-server-tls-enabled", true);
         let management_server_tls_keystore = r.string("management-server-tls-keystore", "");
@@ -474,8 +496,28 @@ impl ServerProperties {
             false,
         )
     }
+    /// Through a new file renamed over the old one: a crash or a full disk mid-write leaves the
+    /// old file, not a short one read as defaults (with a new management secret). A new file is
+    /// its owner's only, as it holds the RCON password and that secret; an existing one keeps its
+    /// permissions.
     pub fn store(&self, path: &std::path::Path) -> std::io::Result<()> {
-        std::fs::write(path, self.stored(now_millis()))
+        let tmp = path.with_extension(format!("properties.{}.tmp", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let written = options.open(&tmp).and_then(|mut file| {
+            std::io::Write::write_all(&mut file, self.stored(now_millis()).as_bytes())?;
+            file.sync_all()?;
+            if let Ok(meta) = std::fs::metadata(path) {
+                std::fs::set_permissions(&tmp, meta.permissions())?;
+            }
+            std::fs::rename(&tmp, path)
+        });
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written
     }
 
     /// MutableValue.update: change one key and re-read everything (the
@@ -594,7 +636,30 @@ fn is_component(v: &Json) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::java_properties::line_separator;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_properties_file_is_its_owners_and_an_old_one_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("horizon-props-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("server.properties");
+        let props = ServerProperties::from_file(&path, &mut Fixed).unwrap();
+        props.store(&path).unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        props.store(&path).unwrap();
+        assert_eq!(mode(&path), 0o640);
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "no temporary file left"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    use horizon_java_properties::line_separator;
     struct Fixed;
     impl Entropy for Fixed {
         fn next_long(&mut self) -> i64 {
@@ -643,18 +708,31 @@ mod tests {
     }
 
     #[test]
+    fn the_secret_never_comes_from_the_seed_stream() {
+        // Two first starts from the same seed stream: the same world seed, never the same secret.
+        let a = ServerProperties::new(Properties::default(), &mut SystemEntropy(42)).unwrap();
+        let b = ServerProperties::new(Properties::default(), &mut SystemEntropy(42)).unwrap();
+        assert_eq!(a.seed, b.seed);
+        assert_ne!(a.management_server_secret, b.management_server_secret);
+        // And not the first 40 draws of that stream either.
+        let from_stream = generate_secret_key(&mut SystemEntropy(42));
+        assert_ne!(a.management_server_secret, from_stream);
+    }
+
+    #[test]
     fn defaults_match_vanilla_init_settings() {
         let p = ServerProperties::new(Properties::default(), &mut Fixed).unwrap();
-        // Lines end in System.lineSeparator() (java_properties checks that): read them as "\n".
+        // Lines end in the platform line separator (java_properties checks that): read them as "\n".
         let stored = p.stored(0).replace(line_separator(), "\n");
         assert!(stored.starts_with(
             "#Minecraft server properties\n#Thu Jan 01 00:00:00 UTC 1970\naccepts-transfers=false\n"
         ));
         assert!(stored.contains("\nlevel-type=minecraft\\:normal\n"));
-        assert!(
-            stored
-                .contains("\nmanagement-server-secret=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n")
-        );
+        // 40 random letters and digits, as vanilla's.
+        let secret = p.management_server_secret.clone();
+        assert_eq!(secret.len(), 40);
+        assert!(secret.bytes().all(|b| b.is_ascii_alphanumeric()));
+        assert!(stored.contains(&format!("\nmanagement-server-secret={secret}\n")));
         assert!(stored.ends_with("\nview-distance=10\nwhite-list=true\n"));
         assert_eq!(stored.lines().count(), 71);
         assert!(p.random_seed);
@@ -681,6 +759,23 @@ mod tests {
         assert_eq!(
             parse_uuid("1-2-3-4-5"),
             Some(0x0000_0001_0002_0003_0004_0000_0000_0005)
+        );
+    }
+
+    #[test]
+    fn parse_uuid_matches_java_signed_long_and_unicode_hex_digits() {
+        // Signed-long overflow in any group is rejected by Java's UUID.fromString.
+        assert_eq!(parse_uuid("ffffffffffffffff-0-0-0-0"), None);
+        assert_eq!(parse_uuid("8000000000000000-0-0-0-0"), None);
+        // i64::MAX is accepted and masked to the field's low 32 bits.
+        assert_eq!(
+            parse_uuid("7fffffffffffffff-0-0-0-0"),
+            Some(0xffff_ffff_0000_0000_0000_0000_0000_0000)
+        );
+        // Non-ASCII BMP hex digits (Arabic-Indic 1, fullwidth 2/A/f) are accepted.
+        assert_eq!(
+            parse_uuid("\u{0661}-\u{ff12}-\u{ff21}-4-\u{ff46}"),
+            Some(0x0000_0001_0002_000a_0004_0000_0000_000f)
         );
     }
 }

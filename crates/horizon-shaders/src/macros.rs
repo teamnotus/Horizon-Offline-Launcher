@@ -1,22 +1,28 @@
 //! Object-like macros: the ones packs test in `#if` lines and use inside property values
 //! (spec 1.5, 1.5.1). The GLSL preprocessor's function-like macros are not needed here.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
-/// The Iris feature flags (`iris.features.*`) Horizon has. `BLOCK_EMISSION_ATTRIBUTE`: terrain's
+/// The feature flags of `iris.features.*` (spec 3.2) Horizon has. A pack that requires one of
+/// them loads; one it lacks is noted. Horizon defines no `IRIS_FEATURE_<name>` macro for them
+/// (spec OQ-2, docs/cleanroom/README.md): that macro family names another loader, so packs take
+/// the path they take without it. `BLOCK_EMISSION_ATTRIBUTE`: terrain's
 /// `at_midBlock.w` is the light its block gives. `SEPARATE_HARDWARE_SAMPLERS` (ShaderDoc,
 /// "Separate Hardware Shadow Samplers"): `shadowtex0`/`shadowtex1` stay plain depth samplers when
 /// hardware filtering is on, `shadowtex0HW`/`shadowtex1HW` compare; Horizon picks a comparison
 /// sampler by the declared type (`sampler2DShadow`), so they always are. `HIGHER_SHADOWCOLOR`:
 /// `shadowcolor2` to `shadowcolor7` beside the first two. `FADE_VARIABLE`: terrain vertex
 /// programs can read the section's visibility transition as `mc_chunkFade`.
-const FEATURES: [&str; 9] = [
+// Device-dependent support is checked by the renderer before it builds pack pipelines.
+const FEATURES: [&str; 10] = [
     "BLOCK_EMISSION_ATTRIBUTE",
     "COMPUTE_SHADERS",
     "CUSTOM_IMAGES",
     "ENTITY_TRANSLUCENT",
     "FADE_VARIABLE",
     "HIGHER_SHADOWCOLOR",
+    "PER_BUFFER_BLENDING",
     "REVERSED_CULLING",
     "SEPARATE_HARDWARE_SAMPLERS",
     "SSBO",
@@ -143,14 +149,8 @@ impl Macros {
         // default; Iris 1.11.7 defines both too, with or without a resource pack's maps).
         m.define("MC_NORMAL_MAP", "");
         m.define("MC_SPECULAR_MAP", "");
-        // Packs take Iris's extensions (compute programs, images, custom textures) where this
-        // is defined.
-        m.define("IS_IRIS", "");
-        // Iris 1.11.7's own, as it defines them on 26.3 (observed with a probe pack): its version
-        // (1.11.7 as 11107), and translucent terrain sorted back to front, as Horizon sorts it
-        // (vanilla's `VertexSorting.byDistance`, `gfx/translucency.rs`).
-        m.define("IRIS_VERSION", "11107");
-        m.define("IRIS_HAS_TRANSLUCENCY_SORTING", "");
+        // No `IS_IRIS`, `IRIS_VERSION` or `IRIS_HAS_*`: Horizon is not that loader and does not
+        // claim its identity (spec OQ-2, docs/cleanroom/README.md). Packs take their other path.
         // Distant Horizons' block materials, which Iris defines with or without the mod (packs
         // compare ids with them unguarded: Exposa's `blockID == DH_BLOCK_LEAVES`), numbered as
         // the mod's `EDhApiBlockMaterial` numbers them.
@@ -181,34 +181,13 @@ impl Macros {
         self.define("MC_MIPMAP_LEVEL", mipmap_levels.to_string());
     }
 
-    /// Every feature Horizon has, as `IRIS_FEATURE_<name>`: what `shaders.properties` itself is
-    /// read with. Iris 1.11.7 defines a feature it has there whether the pack lists it as
-    /// optional, as required or not at all (probe pack), while its programs see only the optional
-    /// ones (`define_features`).
-    pub fn define_every_feature(&mut self) {
-        for feature in FEATURES {
-            self.define(format!("IRIS_FEATURE_{feature}"), "");
-        }
-    }
-
-    /// `iris.features.optional`'s features Horizon has, as `IRIS_FEATURE_<name>`; a note for
-    /// each feature `iris.features.required` names that it lacks. As in Iris 1.11.7, a name
-    /// matches in any case, and the macro keeps the name as the pack wrote it (`ssbo` defines
-    /// `IRIS_FEATURE_ssbo`).
-    pub fn define_features(&mut self, properties: &crate::Properties) -> Vec<String> {
-        let words = |key: &str| {
-            properties
-                .get(key)
-                .map(|v| v.split_whitespace().map(str::to_owned).collect::<Vec<_>>())
-                .unwrap_or_default()
-        };
-        for feature in words("iris.features.optional") {
-            if is_feature(&feature) {
-                self.define(format!("IRIS_FEATURE_{feature}"), "");
-            }
-        }
-        words("iris.features.required")
-            .into_iter()
+    /// A note for each feature `iris.features.required` names that Horizon lacks; a name matches
+    /// in any case. Optional features need nothing: no macro is defined for them (see `FEATURES`).
+    pub fn feature_notes(properties: &crate::Properties) -> Vec<String> {
+        properties
+            .get("iris.features.required")
+            .unwrap_or_default()
+            .split_whitespace()
             .filter(|f| !is_feature(f))
             .map(|f| format!("the pack requires `{f}`, which is not supported yet"))
             .collect()
@@ -274,8 +253,15 @@ impl Macros {
 
     /// Whether upcoming source lines continue a call, including one whose expanded name
     /// ends `text` and whose opening parenthesis is on the next nonempty line.
-    pub(crate) fn unfinished_call(&self, text: &str, upcoming: &[&str]) -> bool {
-        let (tokens, unfinished) = self.expand_tokens(expansion_tokens(text));
+    /// Its expansion is charged to `budget`, which the caller checks (`false` once over).
+    pub(crate) fn unfinished_call(&self, text: &str, upcoming: &[&str], budget: &Budget) -> bool {
+        let Some(start) = expansion_tokens_within(text, budget) else {
+            return false;
+        };
+        let (tokens, unfinished) = self.expand_tokens(start, budget);
+        if budget.over() {
+            return false;
+        }
         unfinished
             || (tokens.iter().rfind(|t| !t.blank()).is_some_and(|t| {
                 self.0.get_key_value(&t.text).is_some_and(|(name, m)| {
@@ -292,7 +278,14 @@ impl Macros {
     /// expansion, so `A` defined as `A + 1` stops. Function-like macros take their arguments
     /// (expanded first, raw beside `##`, which pastes) when a `(` follows their name.
     pub fn expand(&self, text: &str) -> String {
-        self.expand_tokens(expansion_tokens(text))
+        self.expand_within(text, &Budget::new(MAX_LINE_TOKENS))
+    }
+
+    /// [`Self::expand`] that stops, leaving the rest as it is, once the replacements have added
+    /// more tokens than `budget` allows (`budget.over()` then): `#define A1 A0 A0`, `#define A2
+    /// A1 A1`... doubles the text with every level.
+    pub(crate) fn expand_within(&self, text: &str, budget: &Budget) -> String {
+        self.expand_tokens(expansion_tokens(text), budget)
             .0
             .iter()
             .map(|t| t.text.as_str())
@@ -302,10 +295,11 @@ impl Macros {
     fn expand_tokens<'a>(
         &'a self,
         mut tokens: Vec<ExpansionToken<'a>>,
+        budget: &Budget,
     ) -> (Vec<ExpansionToken<'a>>, bool) {
         let mut i = 0;
         let mut unfinished = false;
-        while i < tokens.len() {
+        while i < tokens.len() && !budget.over() {
             let Some((name, m)) = self.0.get_key_value(tokens[i].text.as_str()) else {
                 i += 1;
                 continue;
@@ -316,7 +310,12 @@ impl Macros {
             }
             let mut hidden = tokens[i].hidden.clone();
             let (mut body, next) = match &m.params {
-                None => (expansion_tokens(&m.body), i + 1),
+                None => {
+                    let Some(body) = expansion_tokens_within(&m.body, budget) else {
+                        break;
+                    };
+                    (body, i + 1)
+                }
                 Some(params) => {
                     let Some((args, next)) = arguments(&tokens, i + 1) else {
                         unfinished |= tokens[i + 1..]
@@ -329,7 +328,11 @@ impl Macros {
                     // A call can cross a replacement boundary. Only disabling shared by
                     // its name and closing parenthesis carries into the new replacement.
                     hidden.retain(|h| tokens[next - 1].hidden.contains(h));
-                    (self.substitute(params, &args, &m.body), next)
+                    // `substitute` has charged everything it built, before building it.
+                    let Some(body) = self.substitute(params, &args, &m.body, budget) else {
+                        break;
+                    };
+                    (body, next)
                 }
             };
             hidden.push(name);
@@ -347,13 +350,31 @@ impl Macros {
         (tokens, unfinished)
     }
 
-    /// A function-like macro's body with its parameters replaced.
+    /// A function-like macro's body with its parameters replaced, or `None` once `budget` is
+    /// over. Every token is charged before it is copied into the replacement, and a nested
+    /// expansion that goes over stops the construction at once.
     fn substitute<'a>(
         &'a self,
         params: &[String],
         args: &[Vec<ExpansionToken<'a>>],
         body: &str,
-    ) -> Vec<ExpansionToken<'a>> {
+        budget: &Budget,
+    ) -> Option<Vec<ExpansionToken<'a>>> {
+        if !budget.enter() {
+            return None;
+        }
+        let built = self.substitute_tokens(params, args, body, budget);
+        budget.leave();
+        built
+    }
+
+    fn substitute_tokens<'a>(
+        &'a self,
+        params: &[String],
+        args: &[Vec<ExpansionToken<'a>>],
+        body: &str,
+        budget: &Budget,
+    ) -> Option<Vec<ExpansionToken<'a>>> {
         let tokens = lex(body);
         let pasted = |at: usize, step: isize| {
             let mut j = at as isize + step;
@@ -369,19 +390,38 @@ impl Macros {
                     let arg = args.get(k).map_or(&[][..], |a| a.as_slice());
                     let from = arg.iter().position(|t| !t.blank()).unwrap_or(arg.len());
                     let end = arg.iter().rposition(|t| !t.blank()).map_or(from, |n| n + 1);
-                    let arg = arg[from..end].to_vec();
+                    let arg = &arg[from..end];
                     if pasted(at, -1) || pasted(at, 1) {
                         if arg.is_empty() {
                             // An empty paste operand must not capture the preceding token.
+                            if !budget.spend(1) {
+                                return None;
+                            }
                             out.push(ExpansionToken::new(""));
                         } else {
-                            out.extend(arg);
+                            if !budget.spend(weight_of(arg)) {
+                                return None;
+                            }
+                            out.extend_from_slice(arg);
                         }
                     } else {
-                        out.extend(self.expand_tokens(arg).0);
+                        // The copy to expand, then its expansion, are charged before they exist.
+                        if !budget.spend(weight_of(arg)) {
+                            return None;
+                        }
+                        let (expanded, _) = self.expand_tokens(arg.to_vec(), budget);
+                        if budget.over() || !budget.spend(weight_of(&expanded)) {
+                            return None;
+                        }
+                        out.extend(expanded);
                     }
                 }
-                None => out.push(ExpansionToken::new(token)),
+                None => {
+                    if !budget.spend(text_weight(token)) {
+                        return None;
+                    }
+                    out.push(ExpansionToken::new(token));
+                }
             }
         }
         // `a ## b` → `ab`.
@@ -401,6 +441,11 @@ impl Macros {
                     if left.text.is_empty() {
                         left = token;
                     } else if !token.text.is_empty() {
+                        // The joined text is charged before it is built: pasting can double a
+                        // token's length with every level and still be one token.
+                        if !budget.spend(text_weight_of_len(left.text.len() + token.text.len())) {
+                            return None;
+                        }
                         left.text.push_str(&token.text);
                         left.hidden.retain(|h| token.hidden.contains(h));
                     }
@@ -418,22 +463,109 @@ impl Macros {
         // `colors2_colorspaces_ ## a ## _to_ ## b ##(x)`) stays the tokens it is made of, as
         // GL drivers' preprocessors leave it: the name before the `(` is then rescanned and can
         // call a macro.
-        joined
-            .into_iter()
-            .flat_map(|token| {
-                let parts = lex(&token.text);
-                if parts.len() < 2 {
-                    return vec![token];
-                }
-                parts
-                    .into_iter()
-                    .map(|text| ExpansionToken {
-                        text: text.into(),
-                        hidden: token.hidden.clone(),
-                    })
-                    .collect()
-            })
-            .collect()
+        let mut split = Vec::with_capacity(joined.len());
+        for token in joined {
+            let parts = lex(&token.text);
+            if parts.len() < 2 {
+                split.push(token);
+                continue;
+            }
+            // The parts are new strings.
+            if !budget.spend(parts.iter().map(|p| text_weight(p)).sum()) {
+                return None;
+            }
+            split.extend(parts.into_iter().map(|text| ExpansionToken {
+                text: text.into(),
+                hidden: token.hidden.clone(),
+            }));
+        }
+        Some(split)
+    }
+}
+
+/// What one token spends: 1, and one more for each 32 bytes of text it owns, so that long
+/// strings (a pasted name that doubles per level) run the budget out as tokens do.
+fn text_weight(text: &str) -> usize {
+    text_weight_of_len(text.len())
+}
+
+fn text_weight_of_len(len: usize) -> usize {
+    1 + len / 32
+}
+
+fn weight_of(tokens: &[ExpansionToken]) -> usize {
+    tokens.iter().map(|t| text_weight(&t.text)).sum()
+}
+
+/// `text` as tokens, charged before the strings are made; `None` when `budget` is over.
+fn expansion_tokens_within<'a>(text: &'a str, budget: &Budget) -> Option<Vec<ExpansionToken<'a>>> {
+    let lexed = lex(text);
+    if !budget.spend(lexed.iter().map(|t| text_weight(t)).sum()) {
+        return None;
+    }
+    Some(lexed.into_iter().map(ExpansionToken::new).collect())
+}
+
+/// Most tokens the replacements of one line may add; a line of real code expands to a few
+/// hundred at most.
+pub(crate) const MAX_LINE_TOKENS: usize = 1 << 16;
+
+/// How deep function-like macro arguments may nest (`f(f(f(...)))`): each level recurses.
+pub(crate) const MAX_NESTING: usize = 64;
+
+/// How many more tokens macro replacements may add, spent as they happen, and how deeply their
+/// arguments may nest.
+pub(crate) struct Budget {
+    left: Cell<usize>,
+    over: Cell<bool>,
+    depth: Cell<usize>,
+}
+
+impl Budget {
+    pub(crate) fn new(tokens: usize) -> Self {
+        Self {
+            left: Cell::new(tokens),
+            over: Cell::new(false),
+            depth: Cell::new(0),
+        }
+    }
+
+    /// One level deeper; `false` (and from then on `over`) past [`MAX_NESTING`].
+    fn enter(&self) -> bool {
+        if self.depth.get() >= MAX_NESTING {
+            self.left.set(0);
+            self.over.set(true);
+            return false;
+        }
+        self.depth.set(self.depth.get() + 1);
+        true
+    }
+
+    fn leave(&self) {
+        self.depth.set(self.depth.get() - 1);
+    }
+
+    /// Takes `n` tokens; `false` (and from then on `over`) when fewer are left.
+    fn spend(&self, n: usize) -> bool {
+        match self.left.get().checked_sub(n) {
+            Some(left) => {
+                self.left.set(left);
+                true
+            }
+            None => {
+                self.left.set(0);
+                self.over.set(true);
+                false
+            }
+        }
+    }
+
+    pub(crate) fn left(&self) -> usize {
+        self.left.get()
+    }
+
+    pub(crate) fn over(&self) -> bool {
+        self.over.get()
     }
 }
 
@@ -565,13 +697,14 @@ mod tests {
         .map_err(|e| format!("{e:?}"))
     }
 
-    /// Packs see what Iris 1.11.7 defines on 26.3: GL and GLSL 3.3, its version and its sorted
-    /// translucent terrain, so they take the paths they take there.
+    /// Packs see GL and GLSL 3.3, and no other loader's identity (spec OQ-2): a declaration made
+    /// only under that condition is seen.
     #[test]
-    fn programs_see_the_versions_iris_reports() {
+    fn programs_see_gl_33_and_no_other_loader() {
         let fsh = "#version 330\nout vec4 c;\n\
-                   #if MC_GL_VERSION == 330 && MC_GLSL_VERSION == 330 && IRIS_VERSION >= 11107 \\\n\
-                   && defined IRIS_HAS_TRANSLUCENCY_SORTING\nconst float v = 1.0;\n#endif\n\
+                   #if MC_GL_VERSION == 330 && MC_GLSL_VERSION == 330 && !defined IS_IRIS \\\n\
+                   && !defined IRIS_VERSION && !defined IRIS_HAS_TRANSLUCENCY_SORTING\n\
+                   const float v = 1.0;\n#endif\n\
                    void main() { c = vec4(v); }\n";
         translates(fsh, &Macros::standard()).unwrap();
     }
@@ -601,70 +734,24 @@ mod tests {
         translates(fsh, &Macros::standard()).unwrap();
     }
 
-    /// `BLOCK_EMISSION_ATTRIBUTE` (terrain's `at_midBlock.w` is its block's light) is one
-    /// Horizon has: defined when optional, no note when required.
+    /// A required feature Horizon has loads without a note, one it lacks gets a note, whatever the
+    /// case it is written in; no `IRIS_FEATURE_*` macro is defined either way (spec OQ-2).
     #[test]
-    fn block_emission_attribute_is_a_feature() {
+    fn required_features_are_noted_and_never_defined() {
         let properties = crate::Properties::parse(
-            "iris.features.optional = BLOCK_EMISSION_ATTRIBUTE\n\
-             iris.features.required = BLOCK_EMISSION_ATTRIBUTE\n",
+            "iris.features.optional = COMPUTE_SHADERS ssbo NOT_A_FEATURE\n\
+             iris.features.required = BLOCK_EMISSION_ATTRIBUTE HIGHER_SHADOWCOLOR custom_images \
+             Not_A_Feature\n",
             &Macros::standard(),
         );
-        let mut m = Macros::standard();
-        assert!(m.define_features(&properties).is_empty());
-        assert!(m.is_defined("IRIS_FEATURE_BLOCK_EMISSION_ATTRIBUTE"));
-    }
-
-    #[test]
-    fn iris_features_are_defined_or_noted() {
-        let properties = crate::Properties::parse(
-            "iris.features.optional = COMPUTE_SHADERS SEPARATE_HARDWARE_SAMPLERS NOT_A_FEATURE\n\
-             iris.features.required = ENTITY_TRANSLUCENT SEPARATE_HARDWARE_SAMPLERS NOT_A_FEATURE\n",
-            &Macros::standard(),
-        );
-        let mut m = Macros::standard();
-        let notes = m.define_features(&properties);
-        assert!(m.is_defined("IRIS_FEATURE_COMPUTE_SHADERS"));
-        assert!(m.is_defined("IRIS_FEATURE_SEPARATE_HARDWARE_SAMPLERS"));
-        assert!(!m.is_defined("IRIS_FEATURE_NOT_A_FEATURE"));
         assert_eq!(
-            notes,
-            ["the pack requires `NOT_A_FEATURE`, which is not supported yet"]
-        );
-        // HIGHER_SHADOWCOLOR: Iris 1.11.7 defines it for `iris.features.optional` (probe p7951c).
-        let mut m = Macros::default();
-        let notes = m.define_features(&crate::Properties::parse(
-            "iris.features.optional = HIGHER_SHADOWCOLOR\n\
-             iris.features.required = HIGHER_SHADOWCOLOR\n",
-            &Macros::default(),
-        ));
-        assert!(m.is_defined("IRIS_FEATURE_HIGHER_SHADOWCOLOR") && notes.is_empty());
-    }
-
-    /// Iris 1.11.7, with probe packs of our own (#8996): a feature name matches in any case, and
-    /// an optional one defines the macro with the name as written, not in upper case.
-    #[test]
-    fn feature_names_match_in_any_case() {
-        let mut m = Macros::standard();
-        let notes = m.define_features(&crate::Properties::parse(
-            "iris.features.optional = ssbo Custom_Images\n\
-             iris.features.required = compute_shaders ssbo custom_images Not_A_Feature\n",
-            &Macros::standard(),
-        ));
-        assert!(m.is_defined("IRIS_FEATURE_ssbo"));
-        assert!(m.is_defined("IRIS_FEATURE_Custom_Images"));
-        for absent in [
-            "IRIS_FEATURE_SSBO",
-            "IRIS_FEATURE_CUSTOM_IMAGES",
-            "IRIS_FEATURE_compute_shaders",
-            "IRIS_FEATURE_COMPUTE_SHADERS",
-        ] {
-            assert!(!m.is_defined(absent), "{absent}");
-        }
-        assert_eq!(
-            notes,
+            Macros::feature_notes(&properties),
             ["the pack requires `Not_A_Feature`, which is not supported yet"]
         );
+        let mut m = Macros::standard();
+        m.define_renderer(4);
+        let iris: Vec<_> = m.0.keys().filter(|name| name.contains("IRIS")).collect();
+        assert!(iris.is_empty(), "{iris:?}");
     }
 
     #[test]
@@ -725,5 +812,70 @@ mod tests {
         assert_eq!(m.expand("CAT(N, 2) CAT(col, ortex4)"), "N2 colortex4");
         assert_eq!(m.expand("PI() SQ SQ(1"), "3.14 SQ SQ(1");
         assert_eq!(m.get("SQ"), None);
+    }
+
+    /// A body repeating its parameter 8,192 times, called with 8,192 tokens, would copy 67
+    /// million tokens: the budget stops it before any of that is built.
+    #[test]
+    fn an_oversized_replacement_stops_before_it_is_built() {
+        let mut m = Macros::standard();
+        m.define_function("F", vec!["x".into()], &"x ".repeat(8192));
+        let call = format!("F({})", "y ".repeat(8192));
+        let budget = Budget::new(MAX_LINE_TOKENS);
+        let out = m.expand_within(&call, &budget);
+        assert!(budget.over());
+        assert_eq!(out, call, "the line is left as it was");
+        // Nothing near the 67 million tokens was charged or kept.
+        assert_eq!(budget.left(), 0);
+    }
+
+    /// `f(f(f(...)))` recurses once per level: a small stack must not matter.
+    #[test]
+    fn deeply_nested_calls_stop_at_the_depth_limit() {
+        let mut m = Macros::standard();
+        m.define_function("f", vec!["x".into()], "x");
+        let depth = 10_000;
+        let call = format!("{}1{}", "f(".repeat(depth), ")".repeat(depth));
+        let (over, shallow) = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || {
+                let budget = Budget::new(MAX_LINE_TOKENS);
+                m.expand_within(&call, &budget);
+                let ok = format!("{}1{}", "f(".repeat(8), ")".repeat(8));
+                let fine = Budget::new(MAX_LINE_TOKENS);
+                let text = m.expand_within(&ok, &fine);
+                (budget.over(), (fine.over(), text))
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(over);
+        assert_eq!(shallow, (false, "1".to_owned()));
+    }
+
+    /// Pasting keeps one token per level but doubles its text: the bytes are charged too.
+    #[test]
+    fn pasting_that_doubles_a_name_stops_at_the_budget() {
+        let mut m = Macros::standard();
+        m.define_function("D", vec!["x".into()], "x ## x");
+        // The argument beside `##` stays unexpanded, so `E` expands it first and hands `D` the result.
+        m.define_function("E", vec!["x".into()], "D(x)");
+        let depth = 40;
+        let call = format!("{}a{}", "E(".repeat(depth), ")".repeat(depth));
+        let budget = Budget::new(MAX_LINE_TOKENS);
+        let out = m.expand_within(&call, &budget);
+        assert!(budget.over());
+        assert_eq!(out, call);
+    }
+
+    /// A long object-like body is charged by its bytes, before it is copied.
+    #[test]
+    fn a_long_object_like_body_is_charged_by_its_bytes() {
+        let mut m = Macros::standard();
+        m.define("BIG", "x".repeat(1 << 20));
+        let budget = Budget::new(MAX_LINE_TOKENS);
+        let out = m.expand_within("BIG BIG BIG BIG", &budget);
+        assert!(budget.over());
+        assert!(out.len() < 3 << 20, "{} bytes", out.len());
     }
 }

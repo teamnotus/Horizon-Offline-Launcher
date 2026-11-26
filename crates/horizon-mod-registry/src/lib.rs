@@ -1,5 +1,5 @@
 //! `horizon-mod-registry`: the submission form's service at
-//! `playhorizon.dev/api/mods/*` (docs/api/mod-index.md). A creator signs in
+//! `playhorizon.dev/api/mods/*` (docs/modding/src/reference/registry-index.md). A creator signs in
 //! with GitHub, sends a file and its page; the service runs the file's own
 //! checks, uploads it to the registry's `staging` release and opens a pull
 //! request with the entry. Reviewers decide; merging publishes. Signed-in
@@ -11,11 +11,11 @@ pub mod page;
 pub mod ratings;
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Body,
     extract::{
-        DefaultBodyLimit, FromRequest, Multipart, Path as UrlPath, Query, Request, State,
-        multipart::MultipartError,
+        ConnectInfo, DefaultBodyLimit, FromRequest, Multipart, Path as UrlPath, Query, Request,
+        State, multipart::MultipartError,
     },
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Redirect, Response},
@@ -24,16 +24,18 @@ use axum::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use github::GitHub;
 use hmac::{Hmac, Mac};
-use horizon_mods::index::{
+use horizon_platform::mod_package::index::{
     self, Kind,
     registry::{self, Entry, EntryVersion, Sources},
 };
+use horizon_release_sign::native_build::{self, Mod, Request as BuildRequest};
 use ratings::Ratings;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::Sha256;
 use std::{
     collections::{HashMap, VecDeque},
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -51,6 +53,16 @@ const MAX_BODY: usize = index::MAX_FILE as usize + page::MAX_IMAGES + MAX_FORM *
 /// Ratings set per account per hour, and by everyone.
 const RATINGS_PER_ACCOUNT: usize = 30;
 const RATINGS_PER_HOUR: usize = 600;
+/// Maximum mods allowed in a single prebuilt request.
+const MAX_SET_MODS: usize = 64;
+/// Native build requests per address per hour, and from everyone.
+const BUILDS_PER_ADDRESS: usize = 12;
+const BUILDS_PER_HOUR: usize = 120;
+/// Status polls per address per hour, and from everyone: each one costs a GitHub API call.
+const POLLS_PER_ADDRESS: usize = 120;
+const POLLS_PER_HOUR: usize = 1200;
+/// How long a dispatched native build is deduplicated.
+const DISPATCH_DEDUP_WINDOW: Duration = Duration::from_secs(15 * 60);
 /// How long the ratings' totals are served from memory (and cached by
 /// browsers and the launcher).
 const TOTALS_FOR: Duration = Duration::from_secs(60);
@@ -69,18 +81,37 @@ pub struct Config {
     pub scratch: PathBuf,
     /// The ratings' SQLite file (a volume): `:memory:` keeps them in memory.
     pub database: PathBuf,
+    /// `REGISTRY_TRUST_PROXY=1`: the service is only reachable through a proxy that overwrites
+    /// `CF-Connecting-IP`, so the client's address is read from the headers. Off: the TCP peer.
+    pub trust_proxy: bool,
 }
 
 impl Config {
     /// `REGISTRY_PUBLIC_URL`, `REGISTRY_SESSION_KEY`, `REGISTRY_REPO`,
-    /// `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `GITHUB_BOT_TOKEN`,
-    /// `REGISTRY_UPDATE_KEY` (optional), `REGISTRY_DB` (default
-    /// `/data/registry.sqlite3`).
+    /// `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, the bot: `REGISTRY_APP_ID`,
+    /// `REGISTRY_APP_INSTALLATION_ID` and `REGISTRY_APP_KEY_FILE` (the App), else
+    /// `GITHUB_BOT_TOKEN`; `REGISTRY_UPDATE_KEY` (optional), `REGISTRY_DB` (default
+    /// `/data/registry.sqlite3`), `REGISTRY_TRUST_PROXY` (`1` behind a proxy).
     pub fn from_env() -> Result<Config, String> {
         let var = |name: &str| std::env::var(name).map_err(|_| format!("{name} is not set"));
         let key = var("REGISTRY_SESSION_KEY")?;
         if key.len() < 32 {
             return Err("REGISTRY_SESSION_KEY needs at least 32 characters".into());
+        }
+        let app = github::AppCredentials::from_vars(|name| std::env::var(name).ok())?;
+        let mut github = GitHub::new(
+            github::Endpoints::default(),
+            std::env::var("REGISTRY_REPO").unwrap_or_else(|_| "horizon-rust/horizon-mods".into()),
+            var("GITHUB_CLIENT_ID")?,
+            var("GITHUB_CLIENT_SECRET")?,
+            // The App writes when it is set: the token can stay for switching back.
+            match app {
+                Some(_) => String::new(),
+                None => var("GITHUB_BOT_TOKEN")?,
+            },
+        );
+        if let Some(app) = app {
+            github = github.as_app(app);
         }
         Ok(Config {
             public_url: var("REGISTRY_PUBLIC_URL")?
@@ -88,14 +119,7 @@ impl Config {
                 .trim_end_matches('/')
                 .to_owned(),
             session_key: key.into_bytes(),
-            github: GitHub::new(
-                github::Endpoints::default(),
-                std::env::var("REGISTRY_REPO")
-                    .unwrap_or_else(|_| "horizon-rust/horizon-mods".into()),
-                var("GITHUB_CLIENT_ID")?,
-                var("GITHUB_CLIENT_SECRET")?,
-                var("GITHUB_BOT_TOKEN")?,
-            ),
+            github,
             update_key: std::env::var("REGISTRY_UPDATE_KEY")
                 .ok()
                 .filter(|k| !k.is_empty())
@@ -103,6 +127,7 @@ impl Config {
             scratch: std::env::temp_dir().join("horizon-mod-registry"),
             database: std::env::var_os("REGISTRY_DB")
                 .map_or_else(|| PathBuf::from("/data/registry.sqlite3"), PathBuf::from),
+            trust_proxy: std::env::var("REGISTRY_TRUST_PROXY").is_ok_and(|v| v == "1"),
         })
     }
 
@@ -122,6 +147,12 @@ struct Inner {
     recent: Windows,
     /// Ratings set in the last hour, the same way.
     rated: Windows,
+    /// Native build requests in the last hour, by client address ("" for everyone's).
+    build_windows: Windows,
+    /// Deduplication window for recently dispatched native builds (key -> dispatched instant).
+    dispatched: Mutex<HashMap<String, Instant>>,
+    /// Status polls in the last hour, by client address ("" for everyone's).
+    poll_windows: Windows,
     ratings: Mutex<Ratings>,
     /// `GET /api/mods/ratings`' body, and when it was made.
     totals: Mutex<Option<(Instant, String)>>,
@@ -136,15 +167,28 @@ impl App {
             config,
             recent: Mutex::default(),
             rated: Mutex::default(),
+            build_windows: Mutex::default(),
+            dispatched: Mutex::default(),
+            poll_windows: Mutex::default(),
             ratings: Mutex::new(ratings),
             totals: Mutex::default(),
         })))
     }
 }
 
+/// The service's version and the shader API line it serves: a deployment older than a shader
+/// API bump is visible from here, without a signed-in request (#17395).
+async fn healthz() -> String {
+    format!(
+        "ok {} shader-api {}",
+        env!("CARGO_PKG_VERSION"),
+        index::SHADER_API
+    )
+}
+
 pub fn router(app: App) -> Router {
     Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(healthz))
         .route("/api/mods/auth/login", get(login))
         .route("/api/mods/auth/callback", get(callback))
         .route("/api/mods/auth/logout", post(logout))
@@ -154,6 +198,14 @@ pub fn router(app: App) -> Router {
         .route(
             "/api/mods/submit",
             post(submit).layer(DefaultBodyLimit::max(MAX_BODY)),
+        )
+        .route(
+            "/api/native-builds",
+            post(request_native_build).get(get_native_build),
+        )
+        .route(
+            "/api/mods/native-builds",
+            post(request_native_build).get(get_native_build),
         )
         .with_state(app)
 }
@@ -905,6 +957,7 @@ pub fn publish(
     let sha256 = index::sha256_file(file).map_err(bad)?;
     let extension = kind.extension().unwrap_or("zip");
     let version = EntryVersion {
+        native_binaries: Vec::new(),
         version: form.version.trim().to_owned(),
         published: date(now()),
         game: form.game.trim().to_owned(),
@@ -918,8 +971,6 @@ pub fn publish(
     if is_new {
         page::check_new(form, images).map_err(bad)?;
     }
-    let turns_native =
-        kind == Kind::NativeMod && existing.as_ref().is_some_and(|(e, _)| e.kind == Kind::Mod);
     // An owner update: an owner's new version and nothing else of the entry
     // changes (key and owners included).
     let mut owner_update = false;
@@ -968,19 +1019,7 @@ pub fn publish(
                     ),
                 ));
             }
-            // A mod may turn native once, never back (`registry::review`,
-            // docs/native-mods.md): its `.hmod` versions stay published.
-            if entry.kind != kind {
-                if (&entry.kind, &kind) != (&Kind::Mod, &Kind::NativeMod) {
-                    return Err(bad(format!(
-                        "{} is a {}, not a {}: a project's kind never changes (only a mod may turn native-mod, once)",
-                        form.id,
-                        entry.kind.name(),
-                        kind.name()
-                    )));
-                }
-                entry.kind = kind.clone();
-            }
+            index::registry::check_kind(&form.id, &entry.kind, &kind).map_err(bad)?;
             if entry.versions.iter().any(|v| v.version == version.version) {
                 return Err(Refusal::new(
                     StatusCode::CONFLICT,
@@ -1009,13 +1048,15 @@ pub fn publish(
             let (mut a, mut b) = (entry.clone(), before);
             a.versions.clear();
             b.versions.clear();
-            // A mod turning native is reviewed by hand, never an owner update.
             // Only an owner known by ID publishes on their own: a login match alone
             // could be someone who claimed the login after a rename.
             owner_update = matched == Ownership::ById
                 && a == b
                 && images.is_empty()
-                && !turns_native
+                && form
+                    .screenshots
+                    .as_ref()
+                    .is_none_or(|screenshots| screenshots == &entry.screenshots)
                 && (entry.key.is_none() || version.signature.is_some())
                 && version
                     .version
@@ -1105,6 +1146,7 @@ pub fn publish(
     let v = &project.versions[0];
     let capabilities: Vec<String> = v
         .capabilities
+        .known()
         .iter()
         .map(|c| format!("- may {}", c.describe()))
         .collect();
@@ -1114,8 +1156,8 @@ pub fn publish(
         .map(|r| format!("- needs {} {}", r.id, r.version))
         .collect();
     let body = format!(
-        "<!-- submitted-by: {login} -->\n🤖 Submitted through [{site}]({public}/mods/submit) by @{login}. The form opens the pull request with \
-         the registry's token: neither Ludovic nor a reviewer wrote it.\n\n\
+        "<!-- submitted-by: {login} -->\n🤖 Submitted through [{site}]({public}/mods/submit) by @{login}. The form opens the pull request for \
+         them: no maintainer or reviewer wrote it.\n\n\
          | | |\n|---|---|\n| Project | `{id}` ({kind}, {new}) |\n| Version | {version} for {game} |\n| File | `{file}`, {size} bytes, SHA-256 `{sha256}` |\n| Signed | {signed} |\n| Source | {source} |\n\n{lists}\n\n\
          The checks below run the file's own checks again and, for a mod, a trial run in the sandbox. \
          Reviewers: read the source and the checks' report before you approve.",
@@ -1126,13 +1168,7 @@ pub fn publish(
             .map_or(config.public_url.as_str(), |(_, host)| host),
         id = form.id,
         kind = kind.name(),
-        new = if is_new {
-            "new"
-        } else if turns_native {
-            "update: turns native, its `.hmod` versions stay published"
-        } else {
-            "update"
-        },
+        new = if is_new { "new" } else { "update" },
         version = v.version,
         game = v.game,
         file = v.file.name,
@@ -1189,6 +1225,313 @@ pub fn publish(
     Ok(url)
 }
 
+/// The client's address, for the rate limits. Behind a proxy (`trust_proxy`) the TCP peer is the
+/// proxy, so it is Cloudflare's `CF-Connecting-IP` (its edge overwrites one a client sends), else
+/// the last `X-Forwarded-For` hop (the one the proxy appended; the first is whatever the client
+/// sent). Otherwise the headers are the client's own and only the TCP peer counts.
+fn client_ip(config: &Config, headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+    let forwarded = || {
+        let real = headers
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok());
+        let hops = || {
+            headers
+                .get_all("x-forwarded-for")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .flat_map(|v| v.split(','))
+                .last()
+        };
+        real.or_else(hops)
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+    };
+    config
+        .trust_proxy
+        .then(forwarded)
+        .flatten()
+        .or_else(|| peer.map(|p| p.ip().to_string()))
+        .unwrap_or_else(|| "anonymous".to_string())
+}
+
+fn is_hex_str(s: &str, len: usize) -> bool {
+    s.len() == len && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_target_triple(s: &str) -> bool {
+    matches!(
+        s,
+        "x86_64-unknown-linux-gnu"
+            | "x86_64-pc-windows-gnu"
+            | "x86_64-pc-windows-msvc"
+            | "aarch64-pc-windows-msvc"
+            | "aarch64-apple-darwin"
+            | "x86_64-apple-darwin"
+    )
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NativeBuildRequest {
+    pub target: String,
+    pub base: String,
+    pub mods: Vec<NativeBuildMod>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NativeBuildMod {
+    pub id: String,
+    pub version: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NativeBuildQuery {
+    pub target: String,
+    pub base: String,
+    pub key: String,
+}
+
+async fn request_native_build(
+    State(app): State<App>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Json(payload): Json<NativeBuildRequest>,
+) -> Result<Json<serde_json::Value>, Refusal> {
+    let inner = app.0.clone();
+    let ip = client_ip(
+        &inner.config,
+        &headers,
+        peer.map(|Extension(ConnectInfo(a))| a),
+    );
+    if !allow(
+        &inner.build_windows,
+        &ip,
+        BUILDS_PER_ADDRESS,
+        BUILDS_PER_HOUR,
+    ) {
+        return Err(Refusal::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many native build requests this hour: try again later",
+        ));
+    }
+
+    if payload.mods.is_empty() {
+        return Err(bad("a native build request needs at least one mod"));
+    }
+    if payload.mods.len() > MAX_SET_MODS {
+        return Err(bad(format!(
+            "at most {MAX_SET_MODS} mods per native build request"
+        )));
+    }
+
+    let mods: Vec<Mod> = payload
+        .mods
+        .into_iter()
+        .map(|m| Mod {
+            id: m.id,
+            version: m.version,
+            sha256: m.sha256,
+        })
+        .collect();
+
+    let request = BuildRequest::new(&payload.target, &payload.base, mods).map_err(bad)?;
+
+    let key = request.key();
+    let tag = native_build::release_tag(&request.base);
+    let archive_name = native_build::archive(&key, &request.target);
+    let sig_name = native_build::signature(&key, &request.target);
+
+    let gh = inner.config.github.clone();
+    let tag_clone = tag.clone();
+    let archive_clone = archive_name.clone();
+
+    let exists =
+        tokio::task::spawn_blocking(move || gh.release_asset_exists(&tag_clone, &archive_clone))
+            .await
+            .map_err(|e| Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(github_down)?;
+
+    let base_url = format!(
+        "https://github.com/{}/releases/download/{}",
+        inner.config.github.repo, tag
+    );
+    let archive_url = format!("{base_url}/{archive_name}");
+    let sig_url = format!("{base_url}/{sig_name}");
+
+    if exists {
+        return Ok(Json(json!({
+            "status": "ready",
+            "key": key,
+            "tag": tag,
+            "archive": archive_name,
+            "signature": sig_name,
+            "url": archive_url,
+            "sig_url": sig_url,
+        })));
+    }
+
+    // Verify all requested mods exist in the registry, match version and sha256, and are not revoked
+    let mods_to_check = request.mods.clone();
+    let gh = inner.config.github.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), Refusal> {
+        for m in &mods_to_check {
+            let entry = gh.entry(&m.id).map_err(github_down)?;
+            let Some((entry, _blob)) = entry else {
+                return Err(bad(format!("mod {:?} is not in the registry", m.id)));
+            };
+            if entry.kind != Kind::NativeMod {
+                return Err(bad(format!("mod {:?} is not a native mod", m.id)));
+            }
+            let version = entry.versions.iter().find(|v| v.version == m.version);
+            let Some(v) = version else {
+                return Err(bad(format!(
+                    "mod {:?} has no version {:?}",
+                    m.id, m.version
+                )));
+            };
+            if !v.sha256.eq_ignore_ascii_case(&m.sha256) {
+                return Err(bad(format!(
+                    "file SHA-256 mismatch for {:?}@{}: expected {}, got {}",
+                    m.id, m.version, v.sha256, m.sha256
+                )));
+            }
+        }
+        let revoked = gh.revoked().map_err(github_down)?;
+        if let Some(m) = mods_to_check.iter().find(|m| {
+            revoked.iter().any(|r| {
+                r.id == m.id
+                    && r.sha256
+                        .as_ref()
+                        .is_none_or(|h| h.eq_ignore_ascii_case(&m.sha256))
+            })
+        }) {
+            return Err(bad(format!("{}@{} was taken down", m.id, m.version)));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+
+    // Check dedup window
+    let recent = {
+        let dispatched = inner.dispatched.lock().unwrap();
+        dispatched
+            .get(&key)
+            .is_some_and(|at| at.elapsed() < DISPATCH_DEDUP_WINDOW)
+    };
+
+    if !recent {
+        let gh = inner.config.github.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), Refusal> {
+            if !gh.native_base_on_main(&request.base).map_err(github_down)? {
+                return Err(bad("the base commit must be on Horizon's main branch"));
+            }
+            let mut mods_str = String::new();
+            for m in &request.mods {
+                if !mods_str.is_empty() {
+                    mods_str.push(' ');
+                }
+                mods_str.push_str(&m.id);
+                mods_str.push('@');
+                mods_str.push_str(&m.version);
+            }
+            gh.dispatch_native_build("main", &request.target, &request.base, &mods_str)
+                .map_err(github_down)
+        })
+        .await
+        .map_err(|e| Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+
+        inner
+            .dispatched
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Instant::now());
+    }
+
+    Ok(Json(json!({
+        "status": "queued",
+        "key": key,
+        "tag": tag,
+        "archive": archive_name,
+        "signature": sig_name,
+        "url": archive_url,
+        "sig_url": sig_url,
+    })))
+}
+
+async fn get_native_build(
+    State(app): State<App>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Query(query): Query<NativeBuildQuery>,
+) -> Result<Json<serde_json::Value>, Refusal> {
+    if !allow(
+        &app.0.poll_windows,
+        &client_ip(
+            &app.0.config,
+            &headers,
+            peer.map(|Extension(ConnectInfo(a))| a),
+        ),
+        POLLS_PER_ADDRESS,
+        POLLS_PER_HOUR,
+    ) {
+        return Err(Refusal::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many native build polls this hour: try again later",
+        ));
+    }
+    if !is_hex_str(&query.base, 40) {
+        return Err(bad(format!(
+            "{:?} is not a commit (40 hex digits)",
+            query.base
+        )));
+    }
+    if !is_target_triple(&query.target) {
+        return Err(bad(format!(
+            "{:?} is not a valid target triple",
+            query.target
+        )));
+    }
+    if !is_hex_str(&query.key, 64) {
+        return Err(bad(format!(
+            "{:?} is not a request key (64 hex digits)",
+            query.key
+        )));
+    }
+
+    let tag = native_build::release_tag(&query.base);
+    let archive_name = native_build::archive(&query.key, &query.target);
+    let sig_name = native_build::signature(&query.key, &query.target);
+
+    let gh = app.0.config.github.clone();
+    let tag_clone = tag.clone();
+    let archive_clone = archive_name.clone();
+
+    let exists =
+        tokio::task::spawn_blocking(move || gh.release_asset_exists(&tag_clone, &archive_clone))
+            .await
+            .map_err(|e| Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(github_down)?;
+
+    let base_url = format!(
+        "https://github.com/{}/releases/download/{}",
+        app.0.config.github.repo, tag
+    );
+    let archive_url = format!("{base_url}/{archive_name}");
+    let sig_url = format!("{base_url}/{sig_name}");
+
+    let status = if exists { "ready" } else { "queued" };
+    Ok(Json(json!({
+        "status": status,
+        "key": query.key,
+        "tag": tag,
+        "archive": archive_name,
+        "signature": sig_name,
+        "url": archive_url,
+        "sig_url": sig_url,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1225,6 +1568,7 @@ mod tests {
             update_key: None,
             scratch: PathBuf::from("/tmp/horizon-mod-registry-test"),
             database: PathBuf::from(":memory:"),
+            trust_proxy: false,
         };
         let branch = "submit/example-1.0.0";
         let login = "12345678901";
@@ -1287,5 +1631,100 @@ mod tests {
             Some("https://playhorizon.dev.evil.test")
         ));
         assert!(!from_the_site("::", Some("null")));
+    }
+
+    #[test]
+    fn native_build_request_and_key_computation() {
+        let req = NativeBuildRequest {
+            target: "x86_64-unknown-linux-gnu".into(),
+            base: "0123456789abcdef0123456789abcdef01234567".into(),
+            mods: vec![
+                NativeBuildMod {
+                    id: "zoom".into(),
+                    version: "1.0.0".into(),
+                    sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .into(),
+                },
+                NativeBuildMod {
+                    id: "minimap".into(),
+                    version: "2.1.0".into(),
+                    sha256: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+                        .into(),
+                },
+            ],
+        };
+        let mods: Vec<Mod> = req
+            .mods
+            .into_iter()
+            .map(|m| Mod {
+                id: m.id,
+                version: m.version,
+                sha256: m.sha256,
+            })
+            .collect();
+        let built = BuildRequest::new(&req.target, &req.base, mods).expect("valid request");
+        assert_eq!(built.mods[0].id, "minimap");
+        assert_eq!(built.mods[1].id, "zoom");
+        let key = built.key();
+        assert_eq!(key.len(), 64);
+        assert_eq!(
+            native_build::release_tag(&req.base),
+            "native-builds-0123456789ab"
+        );
+        let archive = native_build::archive(&key, &req.target);
+        assert!(archive.starts_with(&key[..16]));
+        assert!(archive.ends_with("-x86_64-unknown-linux-gnu.tar.gz"));
+        let sig = native_build::signature(&key, &req.target);
+        assert!(sig.starts_with(&key[..16]));
+        assert!(sig.ends_with("-x86_64-unknown-linux-gnu.sig"));
+    }
+
+    #[test]
+    fn a_client_cannot_pick_its_own_rate_limit_address() {
+        let config = |trust_proxy| Config {
+            public_url: "https://example.invalid".into(),
+            session_key: Vec::new(),
+            github: GitHub::new(
+                github::Endpoints::default(),
+                "owner/repo".into(),
+                "client".into(),
+                "secret".into(),
+                "token".into(),
+            ),
+            update_key: None,
+            scratch: PathBuf::new(),
+            database: PathBuf::from(":memory:"),
+            trust_proxy,
+        };
+        let peer = Some("192.0.2.1:5000".parse().unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "1.2.3.4, 203.0.113.9".parse().unwrap());
+        headers.insert("cf-connecting-ip", "198.51.100.7".parse().unwrap());
+        // Reached directly, the headers are the client's own: only the TCP peer counts.
+        assert_eq!(client_ip(&config(false), &headers, peer), "192.0.2.1");
+        assert_eq!(client_ip(&config(false), &headers, None), "anonymous");
+        // Behind the proxy, the address it wrote.
+        let behind = config(true);
+        assert_eq!(client_ip(&behind, &headers, peer), "198.51.100.7");
+        headers.remove("cf-connecting-ip");
+        assert_eq!(client_ip(&behind, &headers, peer), "203.0.113.9");
+        assert_eq!(client_ip(&behind, &HeaderMap::new(), peer), "192.0.2.1");
+    }
+
+    #[test]
+    fn native_build_query_validation() {
+        assert!(is_hex_str("0123456789abcdef0123456789abcdef01234567", 40));
+        assert!(!is_hex_str("0123456789abcdef", 40));
+        assert!(!is_hex_str("0123456789abcdef0123456789abcdef0123456g", 40));
+        assert!(is_target_triple("x86_64-unknown-linux-gnu"));
+        assert!(is_target_triple("x86_64-pc-windows-gnu"));
+        assert!(is_target_triple("aarch64-apple-darwin"));
+        assert!(!is_target_triple("riscv64gc-unknown-linux-gnu"));
+    }
+    #[tokio::test]
+    async fn healthz_names_the_shader_api_this_build_serves() {
+        let body = healthz().await;
+        assert!(body.contains(env!("CARGO_PKG_VERSION")), "{body}");
+        assert!(body.contains(index::SHADER_API), "{body}");
     }
 }

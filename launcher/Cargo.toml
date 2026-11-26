@@ -50,6 +50,7 @@ horizon-prepare = { path = "../crates/horizon-prepare" }
 horizon-friends = { path = "../crates/horizon-friends" }
 horizon-bench = { path = "../crates/horizon-bench" }
 # Import modpack: the porting pipeline, run on the player's own files (docs/modpacks.md).
+horizon-addresses = { path = "../crates/horizon-addresses" }
 horizon-port-pack = { path = "../crates/horizon-port-pack" }
 # Horizon's mod registry: its index and the checks a download passes before install.
 horizon-mods = { path = "../crates/horizon-mods", features = ["index"] }

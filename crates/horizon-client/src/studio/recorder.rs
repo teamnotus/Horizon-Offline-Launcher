@@ -4,6 +4,13 @@
 //! thread so gameplay frame rates and latency are unaffected.
 
 use super::mcpr::{McprWriter, Metadata, TimestampedPacket};
+use crate::net::PacketRecorder;
+pub use crate::net::RecorderStatus;
+use horizon_protocol::{
+    buf::Reader,
+    crypto::generate_secret,
+    packets::{login::Property, play},
+};
 use std::{
     io,
     path::{Path, PathBuf},
@@ -13,8 +20,83 @@ use std::{
         mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
+
+/// The id the recorded player's tab list entry has in a recording. The recorder's account id
+/// stays out of the file, and playback takes this id for the local player (their skin is the
+/// entry's textures).
+pub const RECORDER_UUID: u128 = 0;
+
+/// The recorded player's tab list entry as a recording keeps it: their name, game mode and
+/// skin textures (URLs only, unsigned) under [`RECORDER_UUID`]. Nothing of any other player.
+pub fn recorder_entry(
+    name: &str,
+    game_mode: i32,
+    textures: Option<&crate::skins::Textures>,
+) -> play::Clientbound {
+    play::Clientbound::PlayerInfoUpdate(play::PlayerInfoUpdate {
+        // ADD_PLAYER, UPDATE_GAME_MODE, UPDATE_LISTED.
+        actions: 1 | 4 | 8,
+        entries: vec![play::PlayerInfo {
+            uuid: RECORDER_UUID,
+            name: Some(name.to_owned()),
+            properties: textures
+                .filter(|t| t.skin.is_some())
+                .map(|t| Property {
+                    name: "textures".into(),
+                    value: crate::skins::pack(t),
+                    signature: None,
+                })
+                .into_iter()
+                .collect(),
+            game_mode: Some(game_mode),
+            listed: Some(true),
+            ..play::PlayerInfo::default()
+        }],
+    })
+}
+
+/// What a later `PlayerInfoUpdate` of the recorder's own entry keeps: that entry alone, under
+/// [`RECORDER_UUID`], without its chat key and with its textures re-packed as URLs only.
+/// `None` when the update names no one but other players.
+fn own_entry_update(update: &play::PlayerInfoUpdate, own: u128) -> Option<play::Clientbound> {
+    let mut entries: Vec<play::PlayerInfo> = update
+        .entries
+        .iter()
+        .filter(|entry| entry.uuid == own)
+        .cloned()
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+    for entry in &mut entries {
+        entry.uuid = RECORDER_UUID;
+        entry.chat_session = None;
+        // Only the skin: another property is not the recording's to keep.
+        entry
+            .properties
+            .retain(|property| property.name == "textures");
+        for property in &mut entry.properties {
+            if property.name == "textures" {
+                let textures = crate::skins::unpack(
+                    &property.value,
+                    crate::skins::Signature::Unsigned,
+                    crate::skins::texture_uris(),
+                );
+                property.value = crate::skins::pack(&textures);
+                property.signature = None;
+            }
+        }
+    }
+    Some(play::Clientbound::PlayerInfoUpdate(
+        play::PlayerInfoUpdate {
+            // INITIALIZE_CHAT carried the chat key; it is not kept.
+            actions: update.actions & !2,
+            entries,
+        },
+    ))
+}
 
 static RECORDING_NAME_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -26,17 +108,6 @@ enum RecordCommand {
 
 const RECORD_QUEUE_PACKETS: usize = 2048;
 
-/// Status summary of the live recording.
-#[derive(Clone, Debug, PartialEq)]
-pub struct RecorderStatus {
-    pub active: bool,
-    pub path: PathBuf,
-    pub elapsed: Duration,
-    pub packet_count: u64,
-    pub bytes_written: u64,
-    pub error: Option<String>,
-}
-
 /// Asynchronous packet recorder that writes `.mcpr` sessions on a worker thread.
 pub struct StudioRecorder {
     active: Arc<AtomicBool>,
@@ -47,6 +118,8 @@ pub struct StudioRecorder {
     worker: Option<JoinHandle<io::Result<PathBuf>>>,
     start_time: Instant,
     dest_path: PathBuf,
+    /// The recording player's account id, whose own tab list entry the recording keeps.
+    own_player: Option<u128>,
 }
 
 impl StudioRecorder {
@@ -66,6 +139,10 @@ impl StudioRecorder {
         let (sender, receiver): (SyncSender<RecordCommand>, Receiver<RecordCommand>) =
             sync_channel(RECORD_QUEUE_PACKETS);
         let mut writer = McprWriter::new(dest_path.clone(), metadata)?;
+        // Older recordings a crash left are packaged beside this one, off the caller's thread.
+        if let Some(dir) = dest_path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            super::mcpr::recover_crashed_recordings_in_background(dir.to_path_buf());
+        }
 
         let worker_active = active.clone();
         let worker_count = packet_count.clone();
@@ -111,7 +188,7 @@ impl StudioRecorder {
                 }
                 worker_active.store(false, Ordering::SeqCst);
                 writer.finish(duration_ms)?;
-                if let Some(error) = worker_failure.lock().unwrap().take() {
+                if let Some(error) = worker_failure.lock().unwrap().clone() {
                     return Err(io::Error::other(format!(
                         "recording stopped with an error: {error}"
                     )));
@@ -128,7 +205,15 @@ impl StudioRecorder {
             worker: Some(worker),
             start_time,
             dest_path,
+            own_player: None,
         })
+    }
+
+    /// Keep the tab list entry of `uuid` (the recording player, under [`RECORDER_UUID`]) while
+    /// every other player's stays out of the recording. Without it none is kept.
+    pub fn with_own_player(mut self, uuid: u128) -> Self {
+        self.own_player = Some(uuid);
+        self
     }
 
     /// Record a clientbound packet if recording is active.
@@ -196,6 +281,82 @@ impl StudioRecorder {
     }
 }
 
+impl PacketRecorder for StudioRecorder {
+    fn is_active(&self) -> bool {
+        StudioRecorder::is_active(self)
+    }
+    /// Keeps what [`recordable`] lets through: the filter copies what it keeps, and re-encodes
+    /// AddEntity with a fresh UUID.
+    fn received(&self, packet: &play::Clientbound, id: i32, payload: &[u8]) {
+        if let Some((id, payload)) = recordable(packet, id, payload, self.own_player) {
+            StudioRecorder::record_packet(self, id, &payload);
+        }
+    }
+    fn record_packet(&self, id: i32, payload: &[u8]) {
+        StudioRecorder::record_packet(self, id, payload);
+    }
+    fn status(&self) -> RecorderStatus {
+        StudioRecorder::status(self)
+    }
+    fn stop(self: Box<Self>) -> io::Result<PathBuf> {
+        StudioRecorder::stop(*self)
+    }
+}
+
+/// Return the packet bytes safe to persist in a Studio recording.
+///
+/// Unknown packets fail closed so a newly added protocol packet cannot bypass
+/// the privacy policy. `AddEntity` retains its entity id and state, but gets a
+/// fresh UUID so the recording cannot link that entity to an account UUID.
+fn recordable<'a>(
+    packet: &play::Clientbound,
+    packet_id: i32,
+    payload: &'a [u8],
+    own_player: Option<u128>,
+) -> Option<(i32, std::borrow::Cow<'a, [u8]>)> {
+    use play::Clientbound as P;
+    use std::borrow::Cow;
+    match packet {
+        P::AddEntity(entity) => {
+            let mut anonymous = entity.clone();
+            anonymous.uuid = u128::from_be_bytes(generate_secret().ok()?);
+            let encoded = P::AddEntity(anonymous).encode();
+            let mut reader = Reader::new(&encoded);
+            let id = reader.varint().ok()?;
+            Some((id, Cow::Owned(reader.rest().to_vec())))
+        }
+        // Only the recorder's own entry, so the replay's player has the skin it was recorded with.
+        P::PlayerInfoUpdate(update) => {
+            let kept = own_entry_update(update, own_player?)?;
+            let encoded = kept.encode();
+            let mut reader = Reader::new(&encoded);
+            let id = reader.varint().ok()?;
+            Some((id, Cow::Owned(reader.rest().to_vec())))
+        }
+        P::CookieRequest(_)
+        | P::CustomChatCompletions(_)
+        | P::CustomPayload(_)
+        | P::DeleteChat(_)
+        | P::Disconnect(_)
+        | P::DisguisedChat(_)
+        | P::PlayerChat(_)
+        | P::PlayerCombatKill(_)
+        | P::PlayerInfoRemove(_)
+        | P::ResetScore(_)
+        | P::ResourcePackPush(_)
+        | P::ServerLinks(_)
+        | P::SetPlayerTeam(_)
+        | P::SetScore(_)
+        | P::StoreCookie(_)
+        | P::SystemChat(_)
+        | P::TabList(_)
+        | P::TrackedWaypoint(_)
+        | P::Transfer(_)
+        | P::Unknown(..) => None,
+        _ => Some((packet_id, Cow::Borrowed(payload))),
+    }
+}
+
 impl Drop for StudioRecorder {
     fn drop(&mut self) {
         self.active.store(false, Ordering::SeqCst);
@@ -242,7 +403,290 @@ pub fn generate_recording_filename(name: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use horizon_core::nbt::Tag;
+    use horizon_protocol::packets::configuration as cfg;
     use std::fs;
+
+    #[test]
+    fn studio_recording_drops_packets_with_direct_player_identity_or_private_text() {
+        use horizon_protocol::packets::configuration::{
+            ResourcePackPush, ServerLink, ServerLinkKind, ServerLinks, StoreCookie, Transfer,
+        };
+        use play::{
+            ChatTypeBound, Clientbound as P, CustomChatCompletions, PlayerInfo, PlayerInfoRemove,
+            PlayerInfoUpdate, ResetScore, SetPlayerTeam, SetScore, TrackedWaypoint, WaypointId,
+            WaypointTarget,
+        };
+
+        let packets = [
+            P::CookieRequest(cfg::CookieRequest {
+                key: "private_cookie".into(),
+            }),
+            P::CustomChatCompletions(CustomChatCompletions {
+                action: 2,
+                entries: vec!["/msg PlayerName private text".into()],
+            }),
+            P::CustomPayload(cfg::CustomPayload {
+                channel: "private:channel".into(),
+                data: b"private payload".to_vec(),
+            }),
+            P::DeleteChat(play::DeleteChat {
+                signature: (3, Some(vec![1, 2, 3])),
+            }),
+            P::DisguisedChat(play::DisguisedChat {
+                message: Tag::String("private message".into()),
+                chat_type: ChatTypeBound {
+                    chat_type: 0,
+                    name: Tag::String("PlayerName".into()),
+                    target: None,
+                },
+            }),
+            P::PlayerCombatKill(play::PlayerCombatKill {
+                id: 7,
+                message: Tag::String("PlayerName was slain".into()),
+            }),
+            P::PlayerChat(play::PlayerChat {
+                global_index: 1,
+                sender: 7,
+                index: 2,
+                signature: None,
+                content: "private message".into(),
+                timestamp: 3,
+                salt: 4,
+                last_seen: vec![],
+                unsigned_content: None,
+                filter: (0, vec![]),
+                chat_type: ChatTypeBound {
+                    chat_type: 0,
+                    name: Tag::String("PlayerName".into()),
+                    target: None,
+                },
+            }),
+            P::ResetScore(ResetScore {
+                owner: "PlayerName".into(),
+                objective: Some("deaths".into()),
+            }),
+            P::SetScore(SetScore {
+                owner: "PlayerName".into(),
+                objective: "deaths".into(),
+                score: 1,
+                display: None,
+                number_format: None,
+            }),
+            P::PlayerInfoRemove(PlayerInfoRemove { uuids: vec![7] }),
+            P::PlayerInfoUpdate(PlayerInfoUpdate {
+                actions: 1,
+                entries: vec![PlayerInfo {
+                    uuid: 7,
+                    name: Some("PlayerName".into()),
+                    ..PlayerInfo::default()
+                }],
+            }),
+            P::ResourcePackPush(ResourcePackPush {
+                id: 8,
+                url: "https://private.example/pack.zip".into(),
+                hash: "hash".into(),
+                required: false,
+                prompt: None,
+            }),
+            P::ServerLinks(ServerLinks {
+                links: vec![ServerLink {
+                    kind: ServerLinkKind::Known(0),
+                    link: "https://private.example".into(),
+                }],
+            }),
+            P::SetPlayerTeam(SetPlayerTeam {
+                name: "red".into(),
+                method: 3,
+                parameters: None,
+                players: vec!["PlayerName".into()],
+            }),
+            P::StoreCookie(StoreCookie {
+                key: "private_cookie".into(),
+                payload: b"secret".to_vec(),
+            }),
+            P::SystemChat(play::SystemChat {
+                content: Tag::String("private message".into()),
+                overlay: false,
+            }),
+            P::TabList(play::TabList {
+                header: Tag::String("PlayerName".into()),
+                footer: Tag::End,
+            }),
+            P::TrackedWaypoint(TrackedWaypoint {
+                operation: play::waypoint_operation::TRACK,
+                id: WaypointId::Uuid(7),
+                style: "minecraft:default".into(),
+                color: None,
+                target: WaypointTarget::Empty,
+            }),
+            P::Transfer(Transfer {
+                host: "private.example".into(),
+                port: 25565,
+            }),
+            P::Disconnect(cfg::Disconnect {
+                reason: Tag::String("PlayerName was disconnected".into()),
+            }),
+            P::Unknown(999, b"unclassified private payload".to_vec()),
+        ];
+
+        for packet in packets {
+            assert!(
+                recordable(&packet, packet.id(), b"raw packet payload", None).is_none(),
+                "{} should be excluded from recordings",
+                packet.name()
+            );
+        }
+    }
+
+    /// A signed `textures` property as a server sends it: it names the account (`profileId`,
+    /// `profileName`) next to the skin.
+    const SIGNED_TEXTURES: &str = "eyJ0aW1lc3RhbXAiOjEsInByb2ZpbGVJZCI6ImFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5IiwicHJvZmlsZU5hbWUiOiJNZSIsInRleHR1cmVzIjp7IlNLSU4iOnsidXJsIjoiaHR0cHM6Ly90ZXh0dXJlcy5taW5lY3JhZnQubmV0L3RleHR1cmUvYWJjIiwibWV0YWRhdGEiOnsibW9kZWwiOiJzbGltIn19fX0=";
+
+    fn info(uuid: u128, name: &str) -> play::PlayerInfo {
+        play::PlayerInfo {
+            uuid,
+            name: Some(name.into()),
+            properties: vec![Property {
+                name: "textures".into(),
+                value: SIGNED_TEXTURES.into(),
+                signature: Some("signature".into()),
+            }],
+            chat_session: Some((5, 6, vec![1], vec![2])),
+            game_mode: Some(1),
+            ..play::PlayerInfo::default()
+        }
+    }
+
+    #[test]
+    fn studio_recording_keeps_only_the_recorders_own_tab_entry() {
+        let own = 0x99;
+        let packet = play::Clientbound::PlayerInfoUpdate(play::PlayerInfoUpdate {
+            actions: 1 | 2 | 4,
+            entries: vec![info(7, "Other"), info(own, "Me")],
+        });
+        let (id, payload) = recordable(&packet, packet.id(), b"unused", Some(own)).unwrap();
+        let play::Clientbound::PlayerInfoUpdate(kept) =
+            play::Clientbound::decode(id, &payload).unwrap()
+        else {
+            panic!("sanitized packet changed type")
+        };
+
+        // The chat key action is gone, and one entry stays: ours, under the recorder id.
+        assert_eq!(kept.actions, 1 | 4);
+        assert_eq!(kept.entries.len(), 1);
+        let entry = &kept.entries[0];
+        assert_eq!(entry.uuid, RECORDER_UUID);
+        assert_eq!(entry.name.as_deref(), Some("Me"));
+        assert_eq!(entry.game_mode, Some(1));
+        assert_eq!(entry.chat_session, None);
+        let textures = &entry.properties[0];
+        assert_eq!(textures.signature, None);
+        // The skin survives; the account it named does not.
+        let decoded =
+            String::from_utf8(crate::skins::base64_decode(&textures.value).unwrap()).unwrap();
+        assert!(
+            !decoded.contains("profileId") && !decoded.contains("profileName"),
+            "{decoded}"
+        );
+        let skin = crate::skins::unpack(
+            &textures.value,
+            crate::skins::Signature::Unsigned,
+            crate::skins::texture_uris(),
+        );
+        assert_eq!(
+            skin.skin.as_deref(),
+            Some("https://textures.minecraft.net/texture/abc")
+        );
+        assert!(skin.slim);
+    }
+
+    #[test]
+    fn studio_recording_drops_tab_updates_that_name_only_other_players() {
+        let packet = play::Clientbound::PlayerInfoUpdate(play::PlayerInfoUpdate {
+            actions: 1,
+            entries: vec![info(7, "Other")],
+        });
+        assert!(recordable(&packet, packet.id(), b"unused", Some(0x99)).is_none());
+    }
+
+    #[test]
+    fn studio_recording_replaces_entity_uuids_but_keeps_entity_state() {
+        let original = play::AddEntity {
+            id: 18,
+            uuid: 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10,
+            kind: 42,
+            position: [1.0, 64.0, -2.0],
+            velocity: [0.0, 0.0, 0.0],
+            pitch: 1,
+            yaw: 2,
+            head_yaw: 3,
+            data: 4,
+        };
+        let packet = play::Clientbound::AddEntity(original.clone());
+        let (id, payload) = recordable(&packet, packet.id(), b"unused", None).unwrap();
+        let play::Clientbound::AddEntity(recorded) =
+            play::Clientbound::decode(id, &payload).unwrap()
+        else {
+            panic!("sanitized packet changed type")
+        };
+
+        assert_ne!(recorded.uuid, original.uuid);
+        assert_eq!(recorded.id, original.id);
+        assert_eq!(recorded.kind, original.kind);
+        assert_eq!(recorded.position, original.position);
+        assert_eq!(recorded.velocity, original.velocity);
+        assert_eq!(recorded.pitch, original.pitch);
+        assert_eq!(recorded.yaw, original.yaw);
+        assert_eq!(recorded.head_yaw, original.head_yaw);
+        assert_eq!(recorded.data, original.data);
+    }
+
+    #[test]
+    fn queue_failure_stops_both_packet_entry_points() {
+        for timestamped in [false, true] {
+            for disconnected in [false, true] {
+                let (sender, receiver) = sync_channel(1);
+                let recorder = StudioRecorder {
+                    active: Arc::new(AtomicBool::new(true)),
+                    packet_count: Arc::new(AtomicU64::new(0)),
+                    bytes_written: Arc::new(AtomicU64::new(0)),
+                    sender,
+                    failure: Arc::new(std::sync::Mutex::new(None)),
+                    worker: None,
+                    start_time: Instant::now(),
+                    dest_path: PathBuf::from("unused.mcpr"),
+                    own_player: None,
+                };
+                // Disconnect before the recorder's blocking Drop, including on assertion failure.
+                let mut receiver = Some(receiver);
+                if disconnected {
+                    drop(receiver.take());
+                } else {
+                    assert!(recorder.sender.try_send(RecordCommand::Stop).is_ok());
+                }
+                if timestamped {
+                    recorder.record_packet_at(0, 1, &[2]);
+                } else {
+                    recorder.record_packet(1, &[2]);
+                }
+                let status = recorder.status();
+                assert!(!status.active);
+                assert_eq!(
+                    status.error.as_deref(),
+                    Some(if disconnected {
+                        "recorder worker stopped unexpectedly"
+                    } else {
+                        "recorder queue is full; capture stopped"
+                    })
+                );
+                recorder.record_packet(1, &[2]);
+                recorder.record_packet_at(0, 1, &[2]);
+                assert_eq!(recorder.status().error, status.error);
+                assert_eq!(recorder.status().packet_count, 0);
+            }
+        }
+    }
 
     #[test]
     fn test_studio_recorder_lifecycle() {

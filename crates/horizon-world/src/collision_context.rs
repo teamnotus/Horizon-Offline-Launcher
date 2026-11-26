@@ -30,9 +30,33 @@ impl CollisionItem<'_> {
     }
 }
 
+/// Classification supplied by the caller that owns the actual entity, never inferred
+/// from its runtime ID. Living means a non-player living entity. None preserves
+/// defaults for entity-less queries and callers which have not captured a class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntityContextKind {
+    Item,
+    Player,
+    Living,
+    Other,
+    None,
+}
+impl EntityContextKind {
+    pub(crate) fn index(self) -> Option<usize> {
+        match self {
+            Self::Item => Some(0),
+            Self::Player => Some(1),
+            Self::Living => Some(2),
+            Self::Other => Some(3),
+            Self::None => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct CollisionEntity<'a> {
     pub identity: EntityIdentity,
+    pub kind: EntityContextKind,
     /// Entity.getY(), not the minimum Y of its bounding box.
     pub y: f64,
     pub descending: bool,
@@ -55,6 +79,7 @@ pub struct CollisionContext<'a> {
     held: CollisionItem<'a>,
     entity: Option<EntityIdentity>,
     living: bool,
+    kind: EntityContextKind,
     position_only: bool,
 }
 impl<'a> CollisionContext<'a> {
@@ -67,6 +92,7 @@ impl<'a> CollisionContext<'a> {
             held: CollisionItem::EMPTY,
             entity: None,
             living: false,
+            kind: EntityContextKind::None,
             position_only: false,
         }
     }
@@ -86,6 +112,14 @@ impl<'a> CollisionContext<'a> {
         self
     }
 
+    /// The entity class a position context stands for, so declared context shapes for that class
+    /// (`collision_context_shapes`, a mod's vanilla block shapes) apply. Nothing else changes: the
+    /// context still has no entity for the rules that read one (powder snow, liquids).
+    pub const fn with_entity_kind(mut self, kind: EntityContextKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
     /// Ordinary EntityCollisionContext. The native factory overload taking an
     /// explicit fluid flag also uses this path for experimental minecarts.
     pub fn for_entity(entity: CollisionEntity<'a>, always_fluid: bool) -> Self {
@@ -97,6 +131,7 @@ impl<'a> CollisionContext<'a> {
             held: entity.main_hand.unwrap_or(CollisionItem::EMPTY),
             entity: Some(entity.identity),
             living: entity.main_hand.is_some(),
+            kind: entity.kind,
             position_only: false,
         }
     }
@@ -121,6 +156,10 @@ impl<'a> CollisionContext<'a> {
         );
         context.placement = true;
         context
+    }
+
+    pub fn entity_kind(&self) -> EntityContextKind {
+        self.kind
     }
 
     pub fn entity(&self) -> Option<EntityIdentity> {
@@ -166,5 +205,25 @@ impl<'a> CollisionContext<'a> {
             entity_can_stand(self.entity.expect("living context has an entity"), second)?
                 && !first.kind().same_family(second.kind()),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_position_context_with_a_class_picks_its_shapes_and_keeps_no_entity() {
+        let context = CollisionContext::position(64.0)
+            .with_descending(true)
+            .with_entity_kind(EntityContextKind::Player);
+        assert_eq!(context.entity_kind(), EntityContextKind::Player);
+        assert!(context.is_descending());
+        assert!(context.entity().is_none());
+        assert!(context.living_entity().is_none());
+        assert_eq!(
+            CollisionContext::position(64.0).entity_kind(),
+            EntityContextKind::None
+        );
     }
 }

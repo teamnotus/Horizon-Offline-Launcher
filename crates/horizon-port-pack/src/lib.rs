@@ -5,10 +5,12 @@
 //! be rerun, resumed and inspected. The work folder belongs to the user: the
 //! jars they downloaded and what is carried over from them stay there and
 //! are never uploaded or committed.
+mod biome_modifiers;
 pub mod carry;
 pub mod check;
 pub mod classes;
 pub mod classify;
+pub mod datapacks;
 pub mod entry;
 pub mod events;
 pub mod fetch;
@@ -27,3 +29,4 @@ pub mod resourcepacks;
 pub mod upgrade;
 pub mod worldgen;
 mod yung;
+pub mod zip_intake;

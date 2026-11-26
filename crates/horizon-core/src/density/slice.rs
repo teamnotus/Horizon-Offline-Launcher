@@ -29,6 +29,9 @@ pub struct SliceSampler {
     pub axes: SliceAxes,
 }
 impl DensitySampler for SliceSampler {
+    fn pointwise_inputs(&self) -> Option<Vec<&Arc<dyn DensitySampler>>> {
+        Some(vec![&self.input])
+    }
     fn sample_value(
         &self,
         context: &mut SamplerContext,
@@ -85,7 +88,10 @@ impl DensitySampler for SliceSampler {
             self.input.sample_volume(context, samples, reduced)?;
             spread(fixed, volume, reduced, samples, buffer);
             if let (Some(key), Some(planes)) = (plane, &mut context.planes) {
-                planes.insert(key, samples[..reduced.size()].to_vec());
+                let mut stored = context.cache_buffers.pop().unwrap_or_default();
+                stored.clear();
+                stored.extend_from_slice(&samples[..reduced.size()]);
+                planes.insert(key, stored);
             }
             Ok(())
         })

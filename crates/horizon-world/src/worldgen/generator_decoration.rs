@@ -4,17 +4,13 @@
 //! Roots whose algorithm or bindings are not implemented are left out of
 //! execution (but keep their place in vanilla's per-step feature ordering, so
 //! decoration seeds of the remaining features are unchanged).
-use super::structure::{
-    BoundingBox,
-    start::{STEPS, place_in_chunk},
-};
 use super::{
     anchor::WorldGenerationContext,
     biome::BiomeId,
     biome_chunk::BiomeRegion,
     biome_predicate::BiomePredicateBindings,
     biome_source::ResolvedBiomeSource,
-    biome_temperature::BiomeTemperature,
+    biome_temperature::{BiomeTemperature, BiomeTemperatureSettings, TemperatureModifier},
     biome_weather::BiomeWeatherBindings,
     block_feature::FeatureBlockBindings,
     decoration::{DecorationWorld, FeatureDecorationPlan},
@@ -57,14 +53,19 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
+use {
+    super::structure::start::{STEPS, place_in_chunk},
+    horizon_core::bounding_box::BoundingBox,
+};
 
 pub(super) struct Decoration {
     plan: FeatureDecorationPlan,
     names: Vec<String>,
     /// Executable roots by identity, or why the root cannot be executed.
     features: Vec<Result<PlacedFeatureDefinition, String>>,
-    /// Placed features of each biome's generation settings, by BiomeId.
-    biome_features: Vec<BTreeSet<FeatureIdentity>>,
+    /// Placed features of each biome's generation settings, by BiomeId: a
+    /// bit per FeatureIdentity.
+    biome_features: Vec<Vec<u64>>,
     bindings: FeatureBlockBindings<'static>,
     weather: Option<BiomeWeatherBindings>,
     blocks: FeatureBlocks,
@@ -92,6 +93,7 @@ fn possible_biomes(source: &ResolvedBiomeSource) -> Vec<String> {
             .iter()
             .map(|(_, name)| name.clone())
             .collect(),
+        ResolvedBiomeSource::Regions(source) => source.biomes().map(str::to_owned).collect(),
         ResolvedBiomeSource::End(source) => [
             &source.center,
             &source.highlands,
@@ -133,6 +135,12 @@ const FLAT_LAKES: [&str; 2] = [
     "minecraft:lake_lava_surface",
 ];
 impl FlatDecoration {
+    /// None of the biome's entries: the structure pieces alone, for a mod's chunk generator that
+    /// asks for no features.
+    pub(super) const NONE: Self = Self {
+        features: false,
+        lakes: false,
+    };
     /// The settings' `features` and `lakes`, for layers that are all air (`void_gen`) or not and a
     /// biome that is the_void or not.
     pub(super) fn new(features: bool, lakes: bool, void_gen: bool, the_void: bool) -> Self {
@@ -230,7 +238,7 @@ impl Decoration {
                 id
             })
         };
-        let mut biome_features = vec![BTreeSet::new(); data.biome_names().len()];
+        let mut biome_features = vec![Vec::new(); data.biome_names().len()];
         let mut plan = Vec::new();
         for name in possible_biomes(source) {
             let id = data
@@ -250,7 +258,7 @@ impl Decoration {
                     for name in FLAT_LAKES {
                         let feature = identity(name);
                         list.push(feature);
-                        biome_features[id.0 as usize].insert(feature);
+                        set_feature_bit(&mut biome_features[id.0 as usize], feature);
                     }
                 }
                 if flat.is_some_and(|f| !f.keeps_biome_step(index)) {
@@ -276,7 +284,7 @@ impl Decoration {
                 for entry in entries {
                     let feature = identity(&super::tags::identifier(&entry)?);
                     list.push(feature);
-                    biome_features[id.0 as usize].insert(feature);
+                    set_feature_bit(&mut biome_features[id.0 as usize], feature);
                 }
                 steps.push(list);
             }
@@ -284,7 +292,9 @@ impl Decoration {
             if flat.is_some_and(|f| f.lakes) && steps.len() <= LAKES_STEP {
                 steps.resize_with(LAKES_STEP, Vec::new);
                 let lakes = FLAT_LAKES.map(&mut identity).to_vec();
-                biome_features[id.0 as usize].extend(lakes.iter().copied());
+                for &feature in &lakes {
+                    set_feature_bit(&mut biome_features[id.0 as usize], feature);
+                }
                 steps.push(lakes);
             }
             plan.push((id, steps));
@@ -411,37 +421,78 @@ impl Decoration {
         if region[4].is_decorated() {
             return Ok(DecorateStats::default());
         }
-        let mut chunks = Vec::with_capacity(9);
+        // The full chunks of the region, before their terrain moves into it.
+        let full: Vec<ChunkPos> = region
+            .iter()
+            .filter(|chunk| chunk.is_full())
+            .map(|chunk| chunk.position())
+            .collect();
+        let (min_y, height, registry) = (
+            region[4].terrain.min_y(),
+            region[4].terrain.height(),
+            region[4].terrain.registry(),
+        );
+        // Validate every fallible TerrainRegion, BiomeRegion, binding, and
+        // stand-in precondition BEFORE moving caller terrain into stand-ins so
+        // an error can never leave recycled stand-ins (with unrelated chunk
+        // coordinates) inside caller chunks.
+        if region.iter().any(|c| {
+            c.terrain.min_y() != min_y
+                || c.terrain.height() != height
+                || !std::ptr::eq(c.terrain.registry(), registry)
+        }) {
+            return Err(resource(RegionError::InvalidChunks.to_string()));
+        }
+        if !std::ptr::eq(registry, self.bindings.registry()) {
+            return Err(resource(RegionError::InvalidBindings.to_string()));
+        }
         let mut biomes = Vec::with_capacity(9);
-        let (min_y, height) = (region[4].terrain.min_y(), region[4].terrain.height());
-        for chunk in region.iter_mut() {
+        for chunk in region.iter() {
+            biomes.push(chunk.biomes().clone());
+        }
+        let biomes =
+            BiomeRegion::new(biomes, obfuscate_seed(seed)).map_err(|e| resource(e.to_string()))?;
+        // The blocks' facts: `BlockState.isSolidRender` and the rest, the
+        // structure pieces ask them of the blocks around them.
+        let tree_blocks = self
+            .bindings
+            .tree_blocks()
+            .map_err(|e| resource(e.to_string()))?;
+        while worker.decor_standins.len() < 9 {
             // A one-section stand-in while the region holds the terrain: it
-            // is swapped back below, and allocating the full height for nine
-            // stand-ins per region cost more than some features.
+            // is swapped back below and recycled across chunks on this worker.
             let empty = super::terrain::TerrainChunk::new(
-                chunk.position(),
+                center,
                 min_y,
                 16,
                 data.registry(),
                 data.block_states().clone(),
             )
             .map_err(|e| resource(e.to_string()))?;
-            chunks.push(std::mem::replace(&mut chunk.terrain, empty));
-            biomes.push(chunk.biomes().clone());
+            worker.decor_standins.push(empty);
         }
+        let mut standins = std::mem::take(&mut worker.decor_standins);
+        let mut chunks = Vec::with_capacity(9);
+        for chunk in region.iter_mut() {
+            let empty = standins.pop().expect("pre-allocated 9 stand-ins");
+            chunks.push(std::mem::replace(&mut chunk.terrain, empty));
+        }
+        // All `TerrainRegion::new` (including `ChunkIndex::new` uniqueness from
+        // the 3×3 neighborhood check above) and `with_block_bindings`
+        // preconditions were validated before swapping stand-ins into `region`.
         let terrain = TerrainRegion::new(chunks, generation)
             .and_then(|region| region.with_block_bindings(&self.bindings))
-            .map(|region| region.with_world_seed(seed));
-        let terrain = match terrain {
-            Ok(terrain) => terrain,
-            Err(e) => return Err(resource(e.to_string())),
-        };
-        let structures_only = worker.structures_only || !region[4].features;
+            .map(|region| region.with_world_seed(seed))
+            .map_err(|e| resource(e.to_string()))?;
+        let structures_only = worker.structures_only;
         let references = region[4].structure_starts.clone();
         let mut block_entities = Vec::new();
         for chunk in region.iter_mut() {
             block_entities.append(&mut chunk.block_entities);
         }
+        let mut uniform_biomes = std::mem::take(&mut worker.decor_uniform_biomes);
+        uniform_biomes.clear();
+        uniform_biomes.resize(9 * (height / 16).max(0) as usize, UNKNOWN_BIOME);
         let mut world = World {
             block_entities,
             entities: Vec::new(),
@@ -454,11 +505,10 @@ impl Decoration {
                 .as_ref()
                 .and_then(|r| r.blocks.as_ref()),
             region: terrain,
-            biomes: BiomeRegion::new(biomes, obfuscate_seed(seed))
-                .map_err(|e| resource(e.to_string()))?,
+            biomes,
             zone: GenerationWriteZone::new(center, 1),
             center,
-            uniform_biomes: vec![UNKNOWN_BIOME; 9 * (height / 16).max(0) as usize],
+            uniform_biomes,
             biome_quarts: region[4].biomes().quart_range(),
             decoration: self,
             temperatures: &mut worker.temperatures,
@@ -466,15 +516,13 @@ impl Decoration {
             // WorldGenRegion.isOutsideBuildHeight: the level's range, not the noise's.
             build: (min_y, min_y + height),
             shape_ticks: std::cell::RefCell::new(crate::level::Ticks::new(0)),
+            last_tag: None,
+            floor_bounds: [None; 9],
+            shape_capture: std::cell::RefCell::new(Vec::new()),
+            full,
         };
         let mut stats = DecorateStats::default();
         let blocks = self.blocks;
-        // The blocks' facts: `BlockState.isSolidRender` and the rest, the
-        // structure pieces ask them of the blocks around them.
-        let tree_blocks = self
-            .bindings
-            .tree_blocks()
-            .map_err(|e| resource(e.to_string()))?;
         // ChunkGenerator.getWritableArea: the chunk's minimum Y + 1 to its maximum Y.
         let chunk_box = BoundingBox::new(
             [center.x * 16, min_y + 1, center.z * 16],
@@ -551,24 +599,46 @@ impl Decoration {
             },
         );
         // `FillLayerFeature.place` for the chunk: air at the layer's Y becomes the layer.
-        if result.is_ok() && !structures_only {
-            for &(y, state) in &self.top_layers {
-                for dz in 0..16 {
-                    for dx in 0..16 {
-                        let at = [center.x * 16 + dx, y, center.z * 16 + dz];
-                        let current = world
-                            .block(at)
-                            .map_err(|e| GeneratorError::Stage("features", e.to_string()))?;
-                        if data.block_states().get(current).is_air() {
-                            world
-                                .set_block(at, state, 2)
-                                .map_err(|e| GeneratorError::Stage("features", e.to_string()))?;
+        // Fold into `result` so any error still restores caller terrain, stand-ins,
+        // block entities, entities, and worker scratch before returning.
+        let result = result
+            .map_err(|e| GeneratorError::Stage("features", e.to_string()))
+            .and_then(|()| {
+                if !structures_only {
+                    for &(y, state) in &self.top_layers {
+                        for dz in 0..16 {
+                            for dx in 0..16 {
+                                let at = [center.x * 16 + dx, y, center.z * 16 + dz];
+                                let current = world.block(at).map_err(|e| {
+                                    GeneratorError::Stage("features", e.to_string())
+                                })?;
+                                if data.block_states().get(current).is_air() {
+                                    world.set_block(at, state, 2).map_err(|e| {
+                                        GeneratorError::Stage("features", e.to_string())
+                                    })?;
+                                }
+                            }
                         }
                     }
                 }
-            }
+                Ok(())
+            });
+        let World {
+            block_entities,
+            entities,
+            region: world_region,
+            uniform_biomes,
+            ..
+        } = world;
+        for terrain in world_region.into_chunks() {
+            let p = terrain.position();
+            let index = (p.z.wrapping_sub(center.z) + 1) * 3 + p.x.wrapping_sub(center.x) + 1;
+            let standin = std::mem::replace(&mut region[index as usize].terrain, terrain);
+            standins.push(standin);
         }
-        for (pos, nbt) in std::mem::take(&mut world.block_entities) {
+        worker.decor_standins = standins;
+        worker.decor_uniform_biomes = uniform_biomes;
+        for (pos, nbt) in block_entities {
             let index = ((pos[2] >> 4).wrapping_sub(center.z) + 1) * 3
                 + (pos[0] >> 4).wrapping_sub(center.x)
                 + 1;
@@ -577,7 +647,7 @@ impl Decoration {
             }
         }
         // WorldGenRegion.addFreshEntity: into the chunk holding the position.
-        for nbt in std::mem::take(&mut world.entities) {
+        for nbt in entities {
             let Some(at) = block_of(&nbt) else {
                 continue;
             };
@@ -588,12 +658,7 @@ impl Decoration {
                 chunk.entities.push(nbt);
             }
         }
-        for terrain in world.region.into_chunks() {
-            let p = terrain.position();
-            let index = (p.z.wrapping_sub(center.z) + 1) * 3 + p.x.wrapping_sub(center.x) + 1;
-            region[index as usize].terrain = terrain;
-        }
-        result.map_err(|e| GeneratorError::Stage("features", e.to_string()))?;
+        result?;
         stats.failed += structure_errors;
         region[4]
             .terrain
@@ -645,6 +710,42 @@ impl World<'_> {
             MIXED_BIOMES => None,
             id => Some(BiomeId(id)),
         }
+    }
+    /// The region chunk slot of chunk `cx`, `cz` (as `uniform_section`).
+    fn chunk_slot(&self, cx: i32, cz: i32) -> Option<usize> {
+        let (dx, dz) = (
+            i64::from(cx) - i64::from(self.center.x) + 1,
+            i64::from(cz) - i64::from(self.center.z) + 1,
+        );
+        ((0..3).contains(&dx) && (0..3).contains(&dz)).then_some((dz * 3 + dx) as usize)
+    }
+    /// A block write at `[x, y, z]` may raise its chunk's heights up to y + 1.
+    fn raise_floor_bound(&mut self, [x, y, z]: [i32; 3]) {
+        if let Some(slot) = self.chunk_slot(x >> 4, z >> 4)
+            && let Some(bound) = &mut self.floor_bounds[slot]
+        {
+            *bound = (*bound).max(y.saturating_add(1));
+        }
+    }
+    /// `floor_bounds` for chunk `cx`, `cz`, computed from its heightmap on
+    /// first use; `None` outside the region or without the heightmap.
+    fn floor_bound(&mut self, cx: i32, cz: i32) -> Option<i32> {
+        let slot = self.chunk_slot(cx, cz)?;
+        if self.floor_bounds[slot].is_none() {
+            let map = self
+                .region
+                .chunk(cx, cz)
+                .ok()?
+                .heightmap(HeightmapType::OceanFloorWg)?;
+            let mut bound = i32::MIN;
+            for x in 0..16 {
+                for z in 0..16 {
+                    bound = bound.max(map.first_available(x, z).ok()?);
+                }
+            }
+            self.floor_bounds[slot] = Some(bound);
+        }
+        self.floor_bounds[slot]
     }
     /// BiomeManager.getBiome without the zoom when every quart it can pick
     /// lies in biome sections of one and the same biome.
@@ -710,8 +811,9 @@ impl PlacementContext for OriginWorld<'_> {
 /// WorldGenRegion-style view: reads anywhere in the 3×3 region, writes within
 /// the FEATURES step's write radius, biome lookups through the biome zoom.
 struct World<'a> {
-    block_entities: Vec<([i32; 3], crate::nbt::Compound)>,
-    entities: Vec<crate::nbt::Compound>,
+    full: Vec<ChunkPos>,
+    block_entities: Vec<([i32; 3], horizon_core::nbt::Compound)>,
+    entities: Vec<horizon_core::nbt::Compound>,
     level_random: &'a mut dyn super::structure::legacy::PieceRandom,
     structure_mobs: Option<Arc<dyn super::generator::StructureMobs>>,
     starts: Vec<Arc<super::structure::start::StructureStart>>,
@@ -733,6 +835,14 @@ struct World<'a> {
     build: (i32, i32),
     /// The tick capture `shape_update` passes to `updateShape`.
     shape_ticks: std::cell::RefCell<crate::level::Ticks>,
+    /// `block_matches_tag`'s last tag and its states.
+    last_tag: Option<(Box<str>, Option<Arc<BTreeSet<BlockStateId>>>)>,
+    /// Per region chunk (X-major in Z rows, as `uniform_biomes`): a bound no
+    /// OCEAN_FLOOR_WG first-available height in it exceeds, once asked.
+    /// Heightmaps change only through this world's writes, which raise it.
+    floor_bounds: [Option<i32>; 9],
+    /// Reusable capture storage for shape updates in this decoration region.
+    shape_capture: std::cell::RefCell<Vec<crate::level::ticks::CapturedTick>>,
 }
 /// Read-only `LevelAccess` view of the decoration region for
 /// `BlockState.updateShape` (writes go through `World::set_block`).
@@ -740,6 +850,7 @@ struct ShapeLevel<'w, 'a> {
     world: &'w World<'a>,
     random: horizon_core::random::LegacyRandom,
 }
+impl crate::level::BlockEntityNeighbors for ShapeLevel<'_, '_> {}
 impl crate::level::LevelAccess for ShapeLevel<'_, '_> {
     fn block_state(&self, pos: BlockPos) -> BlockStateId {
         self.world
@@ -764,6 +875,42 @@ impl crate::level::LevelAccess for ShapeLevel<'_, '_> {
     }
     fn game_time(&self) -> i64 {
         0
+    }
+    /// The parts' `canSurvive` answer for `state` at `pos`, asked before the block's own rule
+    /// exactly as the live game's level asks it: a mod's answer replaces the rule, so a feature
+    /// and a hand placement agree (#17943).
+    fn before_can_survive(&self, pos: BlockPos, state: BlockStateId, survives: &mut Option<bool>) {
+        *survives = crate::native_worldgen_hooks::can_survive(state, [pos.x, pos.y, pos.z]);
+    }
+    /// The parts of the soil `ground`'s answer for the plant `state` above it, asked before the
+    /// plant's own `mayPlaceOn`, as the live game's level asks it.
+    fn before_can_sustain_plant(
+        &self,
+        state: BlockStateId,
+        ground: BlockStateId,
+        ground_pos: BlockPos,
+        sustains: &mut Option<bool>,
+    ) {
+        *sustains = crate::native_worldgen_hooks::can_sustain_plant(
+            state,
+            ground,
+            [ground_pos.x, ground_pos.y, ground_pos.z],
+        );
+    }
+    /// The parts' `mayPlaceOn` answer for the plant `state` on `ground` at `ground_pos`, asked
+    /// where the plant's own rule would be.
+    fn before_may_place_on(
+        &self,
+        state: BlockStateId,
+        ground: BlockStateId,
+        ground_pos: BlockPos,
+        may: &mut Option<bool>,
+    ) {
+        *may = crate::native_worldgen_hooks::may_place_on(
+            state,
+            ground,
+            [ground_pos.x, ground_pos.y, ground_pos.z],
+        );
     }
     /// Lighting has not run during FEATURES: the light engine has no data for
     /// these chunks, so sky light reads zero too (MushroomBlock.canSurvive).
@@ -791,7 +938,7 @@ impl World<'_> {
         // capturing, scheduling leaves the rest of `Ticks` untouched, so the
         // region keeps one instead of building one per update.
         let mut ticks = self.shape_ticks.borrow_mut();
-        ticks.capture = Some(Vec::new());
+        ticks.capture = Some(std::mem::take(&mut *self.shape_capture.borrow_mut()));
         let updated = behaviours.update_shape(
             &mut level,
             &mut ticks,
@@ -807,21 +954,27 @@ impl World<'_> {
     fn schedule_captured(
         &mut self,
         behaviours: &crate::level::Behaviours,
-        ticks: Vec<crate::level::ticks::CapturedTick>,
+        mut ticks: Vec<crate::level::ticks::CapturedTick>,
     ) -> Result<(), PlacementQueryError> {
-        for t in ticks {
-            let at = [t.pos.x, t.pos.y, t.pos.z];
-            if t.fluid {
-                let fluid = crate::fluid::FluidKind::ALL[t.kind as usize];
-                self.schedule_fluid_tick(at, fluid, t.delay)?;
-            } else {
-                let state = behaviours
-                    .table
-                    .default_state(crate::level::BlockId(t.kind as u16));
-                self.schedule_block_tick(at, state, t.delay)?;
+        let result = (|| {
+            for t in &ticks {
+                let at = [t.pos.x, t.pos.y, t.pos.z];
+                if t.fluid {
+                    if let Some(fluid) = crate::fluid::FluidKind::from_tick_id(t.kind) {
+                        self.schedule_fluid_tick(at, fluid, t.delay)?;
+                    }
+                } else {
+                    let state = behaviours
+                        .table
+                        .default_state(crate::level::BlockId(t.kind as u16));
+                    self.schedule_block_tick(at, state, t.delay)?;
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })();
+        ticks.clear();
+        *self.shape_capture.borrow_mut() = ticks;
+        result
     }
 }
 impl DecorationWorld for World<'_> {
@@ -837,7 +990,11 @@ impl DecorationWorld for World<'_> {
     /// bitset instead of sorting every quart of the column.
     fn chunk_biomes(&mut self, chunk: ChunkPos) -> Result<Vec<BiomeId>, RegionError> {
         let biomes = self.biomes.chunk(chunk).map_err(RegionError::Biome)?;
-        let mut seen: Vec<u64> = Vec::new();
+        // Ordinary registry ids fit in the stack array. Keep a spill for
+        // unusually large modded registries without changing the ascending
+        // iteration order of the bitset.
+        let mut seen = [0u64; 128];
+        let mut seen_spill = Vec::new();
         let mut last = None;
         let mut section = 0;
         while let Some(values) = biomes.section(section) {
@@ -847,15 +1004,25 @@ impl DecorationWorld for World<'_> {
                 }
                 last = Some(id);
                 let word = id.0 as usize / 64;
-                if seen.len() <= word {
-                    seen.resize(word + 1, 0);
+                if let Some(bits) = seen.get_mut(word) {
+                    *bits |= 1 << (id.0 % 64);
+                } else {
+                    let spill_word = word - seen.len();
+                    if seen_spill.len() <= spill_word {
+                        seen_spill.resize(spill_word + 1, 0);
+                    }
+                    seen_spill[spill_word] |= 1 << (id.0 % 64);
                 }
-                seen[word] |= 1 << (id.0 % 64);
             }
             section += 1;
         }
-        let mut out = Vec::new();
-        for (word, &bits) in seen.iter().enumerate() {
+        let count = seen
+            .iter()
+            .chain(seen_spill.iter())
+            .map(|bits| bits.count_ones() as usize)
+            .sum();
+        let mut out = Vec::with_capacity(count);
+        for (word, &bits) in seen.iter().chain(seen_spill.iter()).enumerate() {
             let mut bits = bits;
             while bits != 0 {
                 out.push(BiomeId(word as u32 * 64 + bits.trailing_zeros()));
@@ -866,6 +1033,12 @@ impl DecorationWorld for World<'_> {
     }
     fn set_currently_generating(&mut self, _: Option<FeatureIdentity>) -> Result<(), RegionError> {
         Ok(())
+    }
+}
+impl World<'_> {
+    /// Whether `position` is in one of the region's full chunks.
+    fn is_full_chunk(&self, [x, _, z]: [i32; 3]) -> bool {
+        self.full.iter().any(|p| p.x == x >> 4 && p.z == z >> 4)
     }
 }
 impl FeatureWorld for World<'_> {
@@ -895,16 +1068,23 @@ impl FeatureWorld for World<'_> {
         {
             return Ok(false);
         }
-        let old = self.region.block(position)?;
-        self.region.set_block_worldgen(position, state)?;
+        // ImposterProtoChunk(chunk, false): setBlockState, setBlockEntity,
+        // removeBlockEntity and markPosForPostProcessing change nothing, and
+        // WorldGenRegion.setBlock still answers true.
+        if self.is_full_chunk(position) {
+            return Ok(true);
+        }
+        let old = self.region.set_block_worldgen(position, state)?;
+        self.raise_floor_bound(position);
         // ProtoChunk keeps a block entity that already exists when the same kind
         // of block is set again (a chest turning waterlogged); other changes drop it.
-        let registry = self.decoration.bindings.registry();
-        let same_block = old == state
-            || registry.state(old).map(|s| s.name.as_str())
+        if !self.block_entities.is_empty() && old != state {
+            let registry = self.decoration.bindings.registry();
+            let same_block = registry.state(old).map(|s| s.name.as_str())
                 == registry.state(state).map(|s| s.name.as_str());
-        if !same_block {
-            self.block_entities.retain(|(p, _)| *p != position);
+            if !same_block {
+                self.block_entities.retain(|(p, _)| *p != position);
+            }
         }
         // WorldGenRegion.setBlock: BlockState.getPostProcessPos unless UPDATE_KNOWN_SHAPE.
         if flags & 16 == 0 {
@@ -975,13 +1155,13 @@ fn loot_table_nbt(
     state: BlockStateId,
     table: &str,
     random: &mut impl horizon_core::random::RandomSource,
-) -> Option<crate::nbt::Compound> {
-    use crate::nbt::Tag;
+) -> Option<horizon_core::nbt::Compound> {
+    use horizon_core::nbt::Tag;
     let name = registry.state(state)?.name.to_string();
     if !randomizable_container(&name) {
         return None;
     }
-    let mut nbt = crate::nbt::Compound::new();
+    let mut nbt = horizon_core::nbt::Compound::new();
     nbt.insert("id".into(), Tag::String(name.as_str().into()));
     nbt.insert("LootTable".into(), Tag::String(table.into()));
     nbt.insert("LootTableSeed".into(), Tag::Long(random.next_long()));
@@ -1031,7 +1211,7 @@ impl PlacementContext for World<'_> {
         state: BlockStateId,
         position: [i32; 3],
     ) -> Result<bool, PlacementQueryError> {
-        let collision = self.blocks()?.collision.clone();
+        let collision = &self.blocks()?.collision;
         collision
             .collision_shape(self, state, position)
             .map(|shape| shape.is_empty())
@@ -1077,22 +1257,13 @@ impl PlacementContext for World<'_> {
         position: [i32; 3],
         entity: &str,
     ) -> Result<(), PlacementQueryError> {
-        use crate::nbt::Tag;
         let chunk = self.region.chunk(position[0] >> 4, position[2] >> 4)?;
         let state = chunk.block(position[0], position[1], position[2]);
         let registry = self.decoration.bindings.registry();
         if registry.state(state).map(|s| s.name.as_str()) != Some("minecraft:spawner") {
             return Ok(());
         }
-        let mut mob = crate::nbt::Compound::new();
-        mob.insert("id".into(), Tag::String(entity.into()));
-        let mut data = crate::nbt::Compound::new();
-        data.insert("entity".into(), Tag::Compound(mob));
-        let mut nbt = crate::nbt::Compound::new();
-        nbt.insert("id".into(), Tag::String("minecraft:mob_spawner".into()));
-        nbt.insert("SpawnData".into(), Tag::Compound(data));
-        nbt.insert("SpawnPotentials".into(), Tag::List(Vec::new()));
-        self.set_block_entity(position, nbt)
+        self.set_block_entity(position, super::cave::dungeon_spawner_nbt(entity))
     }
     fn attachment_at(
         &mut self,
@@ -1153,7 +1324,7 @@ impl PlacementContext for World<'_> {
         if let (None, Some(behaviours)) = (self.blocks, self.behaviours) {
             return Ok(behaviours.is_face_sturdy(state, direction));
         }
-        let support = self.blocks()?.support.clone();
+        let support = &self.blocks()?.support;
         support
             .is_face_sturdy(self, state, position, direction, SupportType::Full)
             .map_err(query)
@@ -1167,7 +1338,7 @@ impl PlacementContext for World<'_> {
         if let (None, Some(behaviours)) = (self.blocks, self.behaviours) {
             return Ok(behaviours.is_face_sturdy_center(state, direction));
         }
-        let support = self.blocks()?.support.clone();
+        let support = &self.blocks()?.support;
         support
             .is_face_sturdy(self, state, position, direction, SupportType::Center)
             .map_err(query)
@@ -1190,7 +1361,7 @@ impl PlacementContext for World<'_> {
         state: BlockStateId,
         position: [i32; 3],
     ) -> Result<bool, PlacementQueryError> {
-        let collision = self.blocks()?.collision.clone();
+        let collision = &self.blocks()?.collision;
         let shape = collision
             .collision_shape(self, state, position)
             .map_err(query)?;
@@ -1203,7 +1374,10 @@ impl PlacementContext for World<'_> {
                 (0..ny).all(|y| (0..nz).all(|z| shape.is_full(x as i32, y as i32, z as i32)))
             }))
     }
-    fn add_entity(&mut self, mut nbt: crate::nbt::Compound) -> Result<(), PlacementQueryError> {
+    fn add_entity(
+        &mut self,
+        mut nbt: horizon_core::nbt::Compound,
+    ) -> Result<(), PlacementQueryError> {
         if let Some(mobs) = self.structure_mobs.clone()
             && nbt.contains_key(&"horizon:finalize".into())
         {
@@ -1236,8 +1410,8 @@ impl PlacementContext for World<'_> {
         beam_target: Option<[i32; 3]>,
         invulnerable: bool,
     ) -> Result<(), PlacementQueryError> {
-        use crate::nbt::Tag;
-        let mut nbt = crate::nbt::Compound::new();
+        use horizon_core::nbt::Tag;
+        let mut nbt = horizon_core::nbt::Compound::new();
         nbt.insert("id".into(), Tag::String("minecraft:end_crystal".into()));
         nbt.insert(
             "Pos".into(),
@@ -1257,7 +1431,7 @@ impl PlacementContext for World<'_> {
     fn set_block_entity(
         &mut self,
         position: [i32; 3],
-        nbt: crate::nbt::Compound,
+        nbt: horizon_core::nbt::Compound,
     ) -> Result<(), PlacementQueryError> {
         self.block_entities.retain(|(p, _)| *p != position);
         self.block_entities.push((position, nbt));
@@ -1277,8 +1451,8 @@ impl PlacementContext for World<'_> {
         if registry.state(state).map(|s| s.name.as_str()) != Some("minecraft:end_gateway") {
             return Ok(());
         }
-        use crate::nbt::Tag;
-        let mut nbt = crate::nbt::Compound::new();
+        use horizon_core::nbt::Tag;
+        let mut nbt = horizon_core::nbt::Compound::new();
         nbt.insert("id".into(), Tag::String("minecraft:end_gateway".into()));
         nbt.insert("Age".into(), Tag::Long(0));
         nbt.insert("exit_portal".into(), Tag::IntArray(exit.to_vec()));
@@ -1374,15 +1548,20 @@ impl PlacementContext for World<'_> {
             .zone
             .contains_block(BlockPos::new(position[0], position[1], position[2])))
     }
-    /// ProtoChunk.setBlockState: the section and the stage's heightmaps.
+    /// ProtoChunk.setBlockState: the section and the stage's heightmaps
+    /// (nothing on a full chunk: ImposterProtoChunk(chunk, false)).
     fn set_chunk_block(
         &mut self,
         position: [i32; 3],
         state: BlockStateId,
     ) -> Result<(), PlacementQueryError> {
+        if self.is_full_chunk(position) {
+            return Ok(());
+        }
         self.region
             .set_block_worldgen(position, state)
             .map_err(|e| query(format!("{e:?}")))?;
+        self.raise_floor_bound(position);
         Ok(())
     }
     /// BulkSectionAccess write: section storage only, no heightmap updates.
@@ -1428,9 +1607,12 @@ impl PlacementContext for World<'_> {
         let weather = self
             .decoration
             .weather
-            .clone()
+            .as_ref()
             .ok_or(PlacementQueryError::Unavailable)?;
         let settings = self.temperatures[biome.0 as usize].settings();
+        if cannot_freeze_fast(settings, position[1], self.sea_level()?) {
+            return Ok(false);
+        }
         let mut temperature = std::mem::replace(
             &mut self.temperatures[biome.0 as usize],
             BiomeTemperature::new(settings),
@@ -1447,9 +1629,12 @@ impl PlacementContext for World<'_> {
         let weather = self
             .decoration
             .weather
-            .clone()
+            .as_ref()
             .ok_or(PlacementQueryError::Unavailable)?;
         let settings = self.temperatures[biome.0 as usize].settings();
+        if cannot_snow_fast(settings, position[1], self.sea_level()?) {
+            return Ok(false);
+        }
         let mut temperature = std::mem::replace(
             &mut self.temperatures[biome.0 as usize],
             BiomeTemperature::new(settings),
@@ -1508,17 +1693,37 @@ impl PlacementContext for World<'_> {
         feature: FeatureIdentity,
     ) -> Result<bool, PlacementQueryError> {
         let biome = self.biome_identity(position)?;
-        Ok(self.decoration.biome_features[biome.0 as usize].contains(&feature))
+        let bits = &self.decoration.biome_features[biome.0 as usize];
+        let word = feature.0 as usize / 64;
+        Ok(bits
+            .get(word)
+            .is_some_and(|w| w >> (feature.0 % 64) & 1 != 0))
     }
     fn block_state(&mut self, position: [i32; 3]) -> Result<BlockStateId, PlacementQueryError> {
         self.region.block_state(position)
     }
+    /// TerrainRegion::block_matches_tag (the region holds the same tag
+    /// table), with the last tag's states kept: predicates ask one tag for
+    /// many positions (environment scans), and the table is keyed by name.
     fn block_matches_tag(
         &mut self,
         position: [i32; 3],
         tag: &str,
     ) -> Result<bool, PlacementQueryError> {
-        self.region.block_matches_tag(position, tag)
+        let state = self.region.block(position)?;
+        if self
+            .last_tag
+            .as_ref()
+            .is_none_or(|(name, _)| **name != *tag)
+        {
+            let states = self.decoration.bindings.tags.get(tag).cloned();
+            self.last_tag = Some((tag.into(), states));
+        }
+        let states = self
+            .last_tag
+            .as_ref()
+            .and_then(|(_, states)| states.as_ref());
+        Ok(states.is_some_and(|states| states.contains(&state)))
     }
     fn max_y(&mut self) -> Result<i32, PlacementQueryError> {
         self.region.max_y()
@@ -1548,6 +1753,19 @@ impl PlacementContext for World<'_> {
         if size < 0 || x1 < x0 || z1 < z0 {
             return Ok(None);
         }
+        // Most ore attempts in To The Max's tall range sit above every
+        // column: answered from the chunks' bounds without reading columns.
+        if kind == HeightmapType::OceanFloorWg {
+            let mut below = true;
+            for cx in x0 >> 4..=x1 >> 4 {
+                for cz in z0 >> 4..=z1 >> 4 {
+                    below &= self.floor_bound(cx, cz).is_some_and(|bound| bound < y);
+                }
+            }
+            if below {
+                return Ok(Some(false));
+            }
+        }
         for cx in x0 >> 4..=x1 >> 4 {
             for cz in z0 >> 4..=z1 >> 4 {
                 if !self
@@ -1576,19 +1794,51 @@ impl PlacementContext for World<'_> {
 }
 
 /// The block an entity's `Pos` is in.
-fn block_of(nbt: &crate::nbt::Compound) -> Option<[i32; 3]> {
-    let Some(crate::nbt::Tag::List(p)) = nbt.get(&"Pos".into()) else {
+fn block_of(nbt: &horizon_core::nbt::Compound) -> Option<[i32; 3]> {
+    let Some(horizon_core::nbt::Tag::List(p)) = nbt.get(&"Pos".into()) else {
         return None;
     };
     Some(std::array::from_fn(|i| match p.get(i) {
-        Some(crate::nbt::Tag::Double(b)) => f64::from_bits(*b).floor() as i32,
+        Some(horizon_core::nbt::Tag::Double(b)) => f64::from_bits(*b).floor() as i32,
         _ => 0,
     }))
 }
 
+/// Marks `feature` in a biome's feature bitset (one bit per feature identity).
+fn set_feature_bit(bits: &mut Vec<u64>, feature: FeatureIdentity) {
+    let word = feature.0 as usize / 64;
+    if bits.len() <= word {
+        bits.resize(word + 1, 0);
+    }
+    bits[word] |= 1 << (feature.0 % 64);
+}
+/// Vanilla 26.3 `Biome.shouldFreeze` / `warmEnoughToRain` /
+/// `getHeightAdjustedTemperature` fast check: when `modifier == None` and
+/// `y <= sea_level + 17`, height cooling is not applied, so temperature is
+/// identically `base_temperature` (`>= 0.15_f32` is `false` for `< 0.15_f32`
+/// or `NaN`). Note `shouldFreeze` intentionally ignores `has_precipitation`.
+#[inline]
+fn cannot_freeze_fast(settings: BiomeTemperatureSettings, y: i32, sea_level: i32) -> bool {
+    settings.modifier == TemperatureModifier::None
+        && settings.base_temperature >= 0.15_f32
+        && y <= sea_level.wrapping_add(17)
+}
+
+/// Vanilla 26.3 `Biome.shouldSnow` checks
+/// `getPrecipitationAt(pos, seaLevel) != Precipitation.SNOW`, which is always
+/// false when `!has_precipitation` at every height in addition to the
+/// `warmEnoughToRain` fast check.
+#[inline]
+fn cannot_snow_fast(settings: BiomeTemperatureSettings, y: i32, sea_level: i32) -> bool {
+    !settings.has_precipitation || cannot_freeze_fast(settings, y, sea_level)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::loot_table_nbt;
+    use super::{
+        BiomeTemperature, BiomeTemperatureSettings, BlockPos, TemperatureModifier,
+        cannot_freeze_fast, cannot_snow_fast, loot_table_nbt,
+    };
     use crate::registry::BlockRegistry;
     use horizon_core::random::{LegacyRandom, RandomSource};
 
@@ -1650,18 +1900,20 @@ mod tests {
             .unwrap_or_else(|| panic!("no loot table for {name}"));
             assert_eq!(
                 nbt.get(&"id".into()),
-                Some(&crate::nbt::Tag::String(name.into()))
+                Some(&horizon_core::nbt::Tag::String(name.into()))
             );
             assert_eq!(
                 nbt.get(&"LootTable".into()),
-                Some(&crate::nbt::Tag::String(
+                Some(&horizon_core::nbt::Tag::String(
                     "minecraft:chests/simple_dungeon".into()
                 ))
             );
             // The seed is the first long of the random: same seed, same draw.
             assert_eq!(
                 nbt.get(&"LootTableSeed".into()),
-                Some(&crate::nbt::Tag::Long(LegacyRandom::new(4).next_long()))
+                Some(&horizon_core::nbt::Tag::Long(
+                    LegacyRandom::new(4).next_long()
+                ))
             );
         }
     }
@@ -1692,5 +1944,93 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn warm_biome_shortcuts_match_vanilla_temperature_and_precipitation_thresholds() {
+        use super::super::biome_temperature::Precipitation;
+
+        let sea_level = 63;
+        let temperatures = [
+            -1.0_f32,
+            0.0_f32,
+            0.15_f32.next_down(),
+            0.15_f32,
+            0.15_f32.next_up(),
+            0.2_f32,
+            0.8_f32,
+            2.0_f32,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        let heights = [
+            sea_level - 10,
+            sea_level + 16,
+            sea_level + 17,
+            sea_level + 18,
+            256,
+        ];
+        for &base_temperature in &temperatures {
+            for modifier in [TemperatureModifier::None, TemperatureModifier::Frozen] {
+                for has_precipitation in [false, true] {
+                    let settings = BiomeTemperatureSettings {
+                        base_temperature,
+                        modifier,
+                        has_precipitation,
+                        downfall: 0.5,
+                    };
+                    let mut temp = BiomeTemperature::new(settings);
+                    for &y in &heights {
+                        let skip_freeze = cannot_freeze_fast(settings, y, sea_level);
+                        let skip_snow = cannot_snow_fast(settings, y, sea_level);
+                        for (x, z) in [(0, 0), (17, -29), (-113, 64)] {
+                            let pos = BlockPos::new(x, y, z);
+                            let warm = temp.warm_enough_to_rain(pos, sea_level);
+                            let snows =
+                                temp.precipitation_at(pos, sea_level) == Precipitation::Snow;
+                            if skip_freeze {
+                                assert!(
+                                    warm,
+                                    "cannot_freeze_fast skipped cold pos ({x},{y},{z}) for {settings:?}"
+                                );
+                            }
+                            if skip_snow {
+                                assert!(
+                                    !snows,
+                                    "cannot_snow_fast skipped snowy pos ({x},{y},{z}) for {settings:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Above sea_level + 17, a biome with base_temperature = 0.2_f32 cools below
+        // 0.15_f32 and must NOT take the warm shortcut.
+        let mountain = BiomeTemperatureSettings {
+            base_temperature: 0.2_f32,
+            modifier: TemperatureModifier::None,
+            has_precipitation: true,
+            downfall: 0.5,
+        };
+        assert!(!cannot_freeze_fast(mountain, 256, sea_level));
+        assert!(!cannot_snow_fast(mountain, 256, sea_level));
+        assert!(
+            !BiomeTemperature::new(mountain)
+                .warm_enough_to_rain(BlockPos::new(0, 256, 0), sea_level)
+        );
+
+        // Dry cold biomes can still freeze water (shouldFreeze ignores has_precipitation),
+        // whereas shouldSnow always returns false when !has_precipitation.
+        let dry_cold = BiomeTemperatureSettings {
+            base_temperature: -0.5_f32,
+            modifier: TemperatureModifier::None,
+            has_precipitation: false,
+            downfall: 0.0,
+        };
+        assert!(!cannot_freeze_fast(dry_cold, sea_level, sea_level));
+        assert!(cannot_snow_fast(dry_cold, sea_level, sea_level));
+        assert!(cannot_snow_fast(dry_cold, 256, sea_level));
     }
 }

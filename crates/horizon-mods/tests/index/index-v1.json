@@ -100,7 +100,7 @@
         {
           "version": "1.0.0",
           "published": "2026-10-26",
-          "api": "0.1",
+          "api": "0.2",
           "game": "26.3",
           "file": {
             "name": "glow-1.0.0.hshader",

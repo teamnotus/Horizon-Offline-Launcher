@@ -11,16 +11,15 @@ again restores vanilla's behaviour completely.
 |---|---|
 | Settings, parsing and saving | `crates/horizon-client-render/src/extras.rs` |
 | FPS and click counters (for native mods) | `extras.rs` (pure logic, unit tested) |
-| Dynamic lights: item glow, nearest sources | `crates/horizon-client-render/src/dynamic_light.rs` (unit tested), `game/dynamic_lights.rs`, `terrain.wgsl` and `entity.wgsl` (`dynamic_block_light`) |
+| Dynamic lights: item glow, nearest sources | `crates/horizon-client-render/src/dynamic_light.rs` (unit tested), `game/interface/dynamic_lights.rs`, `terrain.wgsl` and `entity.wgsl` (`dynamic_block_light`) |
 | HUD drawing (a native mod's minimap, corner stacking) | `crates/horizon-client/src/extras_hud.rs` |
 | Minimap colours, tiles and image (for the Minimap native mod) | `crates/horizon-client-render/src/minimap.rs` |
-| Reconnect policy and backoff | `crates/horizon-client/src/reconnect.rs` |
-| Game glue (input hooks, per-frame update) | `crates/horizon-client/src/game/extras.rs` |
-| Mouse Tweaks-style controls, sort buttons | `crates/horizon-client/src/game/tweaks.rs` |
+| Reconnect policy and backoff | `crates/horizon-client/src/reconnect.rs`; its game glue (connect, join, leave, the countdown) in `game/interface/extras/reconnect.rs` |
+| Game glue (input hooks, per-frame update) | `crates/horizon-client/src/game/interface/extras.rs`; each extra's own glue in a child module, `game/interface/extras/` |
+| Mouse Tweaks-style controls, sort buttons | `crates/horizon-client/src/game/interface/extras/mouse_tweaks.rs`, `game/interface/extras/sorting.rs` |
 | Sort order and its clicks | `crates/horizon-client/src/inv_sort.rs` (pure, unit tested) |
 | The music page's rows, and the pools it filters | `options_ui.rs` (`Page::Music`), `crates/horizon-client/src/music.rs` (`track_groups`, `MusicManager::set_off`), `sound_events.rs` (`sound_except`) |
-| Cosmetics (show mine, show others'), off with their flag | `extras.rs`, `crates/horizon-client/src/game/cosmetics.rs` ([cosmetics.md](cosmetics.md)) |
-| The settings page | `extras_ui.rs` (`Page::Extras`, on `settings_shell.rs`): **Options → Horizon Settings... → Extras...**; fullbright, dynamic lights and hiding block-break particles change the picture, so they are on the graphics screen's Quality page instead (`graphics_ui.rs`, **Options → Video Settings...**) |
+| The settings page | `options_ui.rs` (`Page::Extras`): **Options → Horizon Settings... → Extras...**; fullbright, dynamic lights and hiding block-break particles are on the graphics screen's Quality page instead (`graphics_ui.rs`, **Options → Video Settings...**) |
 
 The settings are grouped by extra, under a header each, one to a row, and the strip
 under the list says what the row in focus or under the pointer does. An
@@ -42,6 +41,24 @@ in Controls, and adding one would put a non-vanilla mapping into `options.txt`.
 
 ## The extras
 
+### Spyglass look at the poles (`spyglassPolarLook`, default off)
+- Looking up or down with a spyglass, the two axes of the look no longer cross the
+  screen at the same rate: a small yaw turn of `d` degrees moves the picture sideways
+  by about `d·cos(pitch)` and rolls it around the centre by `d·sin(pitch)` (exactly
+  `atan2(sin d·cos p, cos d)`), so near the poles the picture barely moves sideways
+  while the roll grows. Vanilla turns both axes at the same rate, which is why the
+  horizontal look slows down as the pitch climbs.
+- On, a scoped first-person yaw is multiplied by `1/cos(pitch)`
+  (`spyglass_polar_look::yaw_scale`), which puts the sideways motion back; the pitch
+  keeps vanilla's rate (`degrees_per_count`).
+- The factor is held at 8×, so it stops growing at 82.8°: at the pole itself `1/cos`
+  would be an infinity, and the roll the turn adds grows with the factor, so a bounded
+  factor keeps that roll bounded too (still noticeably faster than at the horizon).
+- Off — the default — the turn is vanilla's, bit for bit. The switch stays on this
+  client; the server sees the turns it makes like any other turn. The maintainer
+  decides whether vanilla's slow horizontal look near the poles should ever stop being
+  the default.
+
 ### Chunk pregeneration (`pregen`, default off)
 - Makes `/pregen` available in single-player and hosted LAN worlds, with the existing cheat and
   permission checks. It does not start generation: run `/pregen start` explicitly.
@@ -54,6 +71,13 @@ in Controls, and adding one would put a non-vanilla mapping into `options.txt`.
 - Displays blocks and entities with a fully bright lightmap, including in dark caves.
 - Turning it off restores the normal lightmap using the current brightness,
   time of day and effects. The brightness slider keeps its normal range.
+- Held off on another's server (#3823): a multiplayer server or another player's LAN world draws the normal
+  lightmap and the graphics screen hides the row, while the saved choice stays for the next world. Single
+  player, a LAN host, a splitscreen seat in P1's world and Replay Studio keep it (`fullbright_held`,
+  `game/options.rs`).
+- Its own key, `key.fullbright` (Controls, unbound by default, saved in `horizon-extras.txt` as
+  `fullbrightKey`), toggles it in play; client mods read and set it through the host's `fullbright` and
+  `set_fullbright` (area `client_options`). Both change nothing while it is held off.
 
 ### Dynamic lights (`dynamicLights`, default off)
 - A light source held by a player or mob (main or off hand), dropped as an item, or an entity on
@@ -73,14 +97,15 @@ in Controls, and adding one would put a non-vanilla mapping into `options.txt`.
 ### Moved to native mods
 
 The **FPS counter**, **Keystrokes**, **Zoom** and the **Minimap** are official native mods now (in
-horizon-rust/horizon-mods under `native/<name>/`, [mods.md](mods.md#horizons-official-mods)), with the same look and
+horizon-rust/horizon-mods under `native/<name>/`, [installing.md](modding/src/start/installing.md#horizons-own-mods)), with the same look and
 options. Players install them from the launcher's Mods page, and the launcher builds them into the game
-([native-mods.md](native-mods.md)). The game keeps
-the hook points they use (`crates/horizon-client/src/game/native_hooks.rs`), and `horizon-extras.txt` keeps the old
-keys and `movedToMods`. The Extras page keeps a **Zoom** row: the mod's switch and Settings button when
+([modding/src/how-to/native-mods.md](modding/src/how-to/native-mods.md)). The game keeps
+the hook points they use (`crates/horizon-client/src/game/native_hooks/`), and `horizon-extras.txt` keeps the old
+keys and `movedToMods`. A port reads its extra's old keys once through the mod API's `official_extra_settings`
+(the keys of each mod id are `MOVED_KEYS` in `crates/horizon-client-render/src/extras.rs`). The Extras page keeps a **Zoom** row: the mod's switch and Settings button when
 it is built in, else a note saying to install it from the Mods page.
 
-The game still draws the minimap, for the native mod (`native_minimap` in `native_hooks.rs`, [mods.md](mods.md)):
+The game still draws the minimap, for the native mod (`native_minimap` in `native_hooks/`, [mods.md](modding/src/how-to/content-mods.md)):
 - a corner map (top right by default), square or round, small/medium/large, zoom 0.5 to 4 blocks per pixel, rotating
   with the player or north up, with the player arrow (vanilla's map decoration sprite);
 - vanilla's `MapColor` per block, as map items use, with the map item's height shading and water-depth dithering;
@@ -97,7 +122,11 @@ The game still draws the minimap, for the native mod (`native_minimap` in `nativ
   (`LivingEntityRenderer.shouldShowName`).
 - Hidden in first person, while sleeping, in spectator mode, while invisible, and
   whenever the team's name tag visibility would hide it, exactly as the other
-  players' tags (`game/names.rs`, `own_name_tag`). Client-only: nothing is sent.
+  players' tags (`game/interface/names.rs`, `own_name_tag`). Client-only: nothing is sent.
+- A Horizon crate, `horizon-name-tag`, registered by `horizon-official`: its switch per
+  splitscreen player, its line in `horizon-extras.txt` (same key) and its row in the Extras
+  page's Third person group. The engine asks `horizon_hooks::Hooks::own_name_tag` each frame;
+  the plain executable has no own name tag.
 
 ### Hide block-break particles (`hideBlockParticles`, default off)
 - Hides the debris particles that burst from a block when it breaks
@@ -165,10 +194,13 @@ once and the screens click exactly as vanilla's (`tools/test_menu_click_parity.p
 and the container screen tests are unchanged).
 
 ### Sorting (`sort`, default off; `sortKey`, unbound)
-- A small button right of the container's title (chests, barrels, ender
-  chests, shulker boxes) and one right of the "Inventory" line (the main
-  inventory; the hotbar is left alone). The key, when bound on the Extras
-  page, sorts the part under the cursor (the container when over no slot).
+- On every menu screen, by its slots' roles (`native_slot_roles`): a small
+  button over the top right of its storage slots (chests, barrels, ender
+  chests, shulker boxes, hoppers, dispensers, a mount's chest, a mod menu
+  type's linked slots) and one right of the "Inventory" line (the main
+  inventory; the hotbar is left alone), crafting tables and workstations
+  included. The key, when bound on the Extras page, sorts the part under the
+  cursor (the storage when over no slot).
 - Partial stacks of one item merge, then the stacks go in creative tab order
   (the search tab's), then by name; full stacks before the partial one,
   empty slots last. It needs an empty hand.
@@ -189,7 +221,7 @@ and the container screen tests are unchanged).
 
 ### Scroll wheel changes settings (`wheelCyclesListSettings`, default off)
 - Off, as in vanilla, the wheel scrolls the list under the cursor, on every settings page, Video's
-  included (`AbstractScrollArea.mouseScrolled`, `OptionsUi::wheel`, `GraphicsUi::wheel`). Scrolling
+  included (`AbstractScrollArea.mouseScrolled`, `OptionsUi::wheel`, `GraphicsScreen::wheel_step`). Scrolling
   through a long page can't change an option that passes under the cursor (#5455, #9633). A cycle
   button outside a list, such as a world's Difficulty, still steps
   (`CycleButton.mouseScrolled`).
@@ -264,6 +296,20 @@ of P1: the others follow P1's answer.
   `horizon-extras.txt`.
 - The pools are filtered where they are picked (`sound_except` in
   `sound_events.rs`), the manager is `music.rs`, and the page is in `options_ui.rs`.
+
+### Modded splashes (`skipModdedSplashesIfVanillaModified`, default on)
+- NeoForge's client setting of the same name, with no Extras page entry. On, a
+  resource pack or a mod that provides `minecraft:texts/splashes.txt` replaces
+  the title screen's whole splash pool; off, every namespace's
+  `texts/splashes.txt` joins it (`crates/horizon-client/src/splashes.rs`). Read
+  on each resource reload.
+
+### Finer far terrain while zoomed (`lodZoomDetail`, default off)
+- No Extras page entry yet: set `lodZoomDetail:true` in `horizon-extras.txt` with
+  the game closed. While a zoom magnifies far terrain (LOD Distance on), its tiles
+  are planned finer, at the cost of more tiles while the zoom is held
+  (`lod::ZoomAim`, `fov.rs`). Off until a measurement shows those tiles arrive
+  while the zoom is still held.
 
 ## Shared rules
 

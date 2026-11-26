@@ -96,8 +96,10 @@ actions! {
     DebugLightmapTexture, "key.debug.lightmapTexture", None;
     DebugImprovedTransparency, "key.debug.improvedTransparency", None;
     Emote, "key.emote", Some(KeyCode::KeyB);
+    Fullbright, "key.fullbright", None;
     HotbarPrevious, "pad.hotbarPrevious", None;
     HotbarNext, "pad.hotbarNext", None;
+    Radial, "pad.radial", None;
 }
 
 impl Action {

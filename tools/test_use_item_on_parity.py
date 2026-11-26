@@ -56,9 +56,10 @@ import json
 import os
 import random
 try:
-    from . import block_update_harness as h, lab, test_dispenser_parity as d, test_rust_parity as base
+    from . import block_update_harness as h, fast_bins, lab, test_dispenser_parity as d, test_rust_parity as base
 except ImportError:
     import block_update_harness as h
+    import fast_bins
     import lab
     import test_dispenser_parity as d
     import test_rust_parity as base
@@ -351,6 +352,34 @@ def statue_case(rng, states, case):
         # The item in the off hand, nothing in the main hand.
         use.update(offhand=use['item'], item='-')
     case['use_item'] = use
+
+
+WAX_CHEST_FACINGS = {'north': (0, -1), 'south': (0, 1), 'west': (-1, 0), 'east': (1, 0)}
+
+
+def wax_chest_case(rng, states, case):
+    """Honeycomb on a copper chest (`HoneycombItem.useOn`), sneaking so the chest does not open:
+    a double chest's other half gets its own `block_change` and wax particles, and the clicked
+    block a second sound. Single chests and a half whose other half is gone or not copper are the
+    controls: `ChestBlock.getConnectedBlockPos` looks only at the clicked state."""
+    name = rng.choice(['copper_chest', 'exposed_copper_chest', 'weathered_copper_chest', 'oxidized_copper_chest'])
+    facing = rng.choice(list(WAX_CHEST_FACINGS))
+    own = rng.choice(['left', 'right', 'single'])
+    props = {'facing': facing, 'waterlogged': 'false'}
+    case['cells'] = [[0, 0, 0, states.get(name, type=own, **props)]]
+    if own != 'single':
+        dx, dz = WAX_CHEST_FACINGS[facing]
+        # ChestBlock.getConnectedDirection: LEFT is facing.getClockWise().
+        dx, dz = (-dz, dx) if own == 'left' else (dz, -dx)
+        other = 'right' if own == 'left' else 'left'
+        partner = rng.choices(['same', 'gone', 'plain'], (6, 1, 1))[0]
+        if partner == 'same':
+            case['cells'].append([dx, 0, dz, states.get(name, type=other, **props)])
+        elif partner == 'plain':
+            case['cells'].append([dx, 0, dz, states.get('chest', type=other, **props)])
+    case['use_item'] = {'item': d_plain(rng.choice(['honeycomb', 'honeycomb', 'honeycomb', 'stick']), rng.choice([1, 16])),
+                        'creative': rng.random() < 0.2, 'sneaking': True, 'food': 20,
+                        'face': rng.choice(['up', 'north', 'south', 'west', 'east'])}
 
 
 def timed_case(rng, states, case):
@@ -683,6 +712,12 @@ def cases(facts, count, seed, transformers=True):
         case = {**h.environment(rng), 'pos': [0, 0, 0]}
         case.pop('raining', None)
         case.pop('thundering', None)
+        if rng.random() < 0.04:
+            wax_chest_case(rng, states, case)
+            case['items'] = []
+            case['mode'] = 'dispense'
+            yield case
+            continue
         if transformers and rng.random() < 0.08:
             transformer_case(rng, states, case)
             case['mode'] = 'dispense'
@@ -956,6 +991,46 @@ def forced_respawn_cases(facts):
                    'respawn_at': {'forced': True, 'consume': False, 'yaw': 37.0}}
 
 
+# Shears on a mob's equipment (`Entity.interact`, `Mob.attemptToShearEquipment`):
+# the first shearable slot in `EquipmentSlot` order comes off, so a horse's or a
+# nautilus's armor goes before its saddle; a sneaking player shears nothing.
+CURSED_HORSE_ARMOR = ('{id:"minecraft:iron_horse_armor",count:1,components:'
+                      '{"minecraft:enchantments":{"minecraft:binding_curse":1}}}')
+# Shears at their last point of durability: they break on the armor.
+WORN_SHEARS = '{id:"minecraft:shears",count:1,components:{"minecraft:damage":237}}'
+SHEARED_EQUIPMENT = [
+    ('minecraft:horse', True, {'saddle': 'saddle'}, False),
+    ('minecraft:horse', True, {'body': 'iron_horse_armor', 'saddle': 'saddle'}, False),
+    ('minecraft:horse', False, {'body': 'diamond_horse_armor'}, False),
+    ('minecraft:horse', False, {'body': 'iron_horse_armor'}, False, WORN_SHEARS),
+    ('minecraft:horse', True, {'body': CURSED_HORSE_ARMOR, 'saddle': 'saddle'}, False),
+    ('minecraft:nautilus', False, {'body': 'golden_nautilus_armor'}, True),
+    ('minecraft:nautilus', True, {'body': 'iron_nautilus_armor', 'saddle': 'saddle'}, False),
+    ('minecraft:nautilus', True, {'body': 'copper_nautilus_armor'}, False),
+    ('minecraft:zombie_nautilus', False, {'body': 'golden_nautilus_armor'}, False),
+    ('minecraft:camel', True, {'saddle': 'saddle'}, False),
+    ('minecraft:llama', True, {'body': 'red_carpet'}, False),
+    ('minecraft:llama', False, {'body': 'white_carpet'}, False),
+    ('minecraft:happy_ghast', False, {'body': 'blue_harness'}, False),
+]
+
+
+def shear_equipment_cases(facts):
+    """A survival player two blocks south right-clicks a mob holding shears."""
+    states = d.States(facts)
+    for index, (mob, tame, equip, sneaking, *shears) in enumerate(SHEARED_EQUIPMENT):
+        target = {'type': mob, 'pos': [0.5, 1.0, 0.5], 'ground': True,
+                  'equip': {slot: item if item.startswith('{') else d.plain(item, 1) for slot, item in equip.items()}}
+        if tame:
+            target['tame'] = True
+        yield {**h.environment(random.Random(20000 + index)), 'pos': [0, 0, 0],
+               'cells': [[0, 0, 0, states.get('stone')]], 'items': [], 'mode': 'dispense',
+               'entities': [target], 'pickup_delay': True,
+               'use_entity': {'item': shears[0] if shears else d.plain('shears', 1), 'creative': False, 'sneaking': sneaking,
+                              'fall_flying': False, 'flying': False, 'fall': 0.0, 'player': [0.5, 1.0, 2.5],
+                              'motion': [0.0, 0.0, 0.0]}}
+
+
 def d_plain(item, count):
     return d.plain(item, count)
 
@@ -966,6 +1041,8 @@ def kind(case, facts):
         return f'respawn at {first}'
     if 'wake' in case:
         return f'villager waking at {first}'
+    if 'use_entity' in case:
+        return 'shears on ' + case['entities'][0]['type'].split(':')[1]
     item = case['use_item']['item']
     item = item.split('"')[1].split(':')[1] if item != '-' else 'empty hand'
     if 'entities' in case:
@@ -988,7 +1065,8 @@ def main():
     all_cases = [*cases(facts, args.count, args.seed, not args.no_transformers),
                  *wake_cases(facts, max(args.count // 10, 1), args.seed),
                  *used_stat_cases(facts, max(args.count // 10, 1), args.seed),
-                 *placement_cases(facts, max(args.count // 10, 1), args.seed), *forced_respawn_cases(facts)]
+                 *placement_cases(facts, max(args.count // 10, 1), args.seed), *forced_respawn_cases(facts),
+                 *shear_equipment_cases(facts)]
     (work / 'cases.jsonl').write_text(''.join(json.dumps(case) + '\n' for case in all_cases))
     classes = work / 'classes'
     classes.mkdir(exist_ok=True)
@@ -998,7 +1076,7 @@ def main():
            '-cp', dependencies, '-d', str(classes), str(java_root / 'dev/horizonlab/parity/VanillaDispenserOracle.java')])
     d.run(['java', '-Xmx3G', '-cp', str(classes) + os.pathsep + dependencies, 'dev.horizonlab.parity.VanillaDispenserOracle',
            str(resources), str(work / 'cases.jsonl'), str(work / 'native.txt')])
-    d.run(['cargo', 'build', '-q', '--profile', 'fast', '-p', 'horizon-client', '--bin', 'horizon-client'], cwd=lab.ROOT,
+    d.run([*fast_bins.command('horizon-client'), '-q'], cwd=lab.ROOT,
           env={**os.environ, 'CARGO_BUILD_JOBS': os.environ.get('CARGO_BUILD_JOBS', '3')})
     d.run([str(lab.cargo_target() / 'fast/horizon-client'), '--resources', str(resources)], cwd=work,
           env=lab.game_env(HORIZON_DISPENSE_FIXTURE=f'{work / "cases.jsonl"},{work / "rust.txt"}'))
@@ -1026,7 +1104,7 @@ def main():
         print(f'{name}: {len(entries)} differing')
         for case, a, b in entries[:args.show]:
             print('  case ' + d.describe(case, facts) + ' use='
-                  + json.dumps(case.get('use_item', case.get('respawn_at', case.get('wake')))))
+                  + json.dumps(case.get('use_item', case.get('respawn_at', case.get('wake', case.get('use_entity'))))))
             print('   native ' + ' | '.join(sorted(a)))
             print('   rust   ' + ' | '.join(sorted(b)))
     total = sum(len(v) for v in groups.values())
