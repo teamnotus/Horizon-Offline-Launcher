@@ -1,6 +1,7 @@
 # Horizon Offline Launcher: tests on every push and pull request; a tag `launcher@1.2.3` builds the
-# launcher for Windows (x64 with its installer, and ARM64), Linux and macOS, signs the checksums and publishes them
-# as a GitHub release, which launchers already installed update themselves from.
+# launcher for Windows (x64 with its installer, and ARM64), Linux (AppImage and tar.gz) and macOS,
+# signs the checksums and publishes them as a GitHub release, which launchers already installed
+# update themselves from.
 name: launcher
 
 on:
@@ -90,7 +91,7 @@ jobs:
           key: ${{ matrix.name }}
       - name: Linux libraries GPUI links to
         if: runner.os == 'Linux'
-        run: bash "$GITHUB_WORKSPACE/tools/ci/apt_install.sh" libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev libvulkan-dev libasound2-dev
+        run: bash "$GITHUB_WORKSPACE/tools/ci/apt_install.sh" libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev libvulkan-dev libasound2-dev patchelf
       - name: Metal shaders at run time without the Metal toolchain
         if: runner.os == 'macOS'
         run: |
@@ -113,6 +114,13 @@ jobs:
             linux) tar -czf ../dist/${{ matrix.asset }} -C "$out" ${{ matrix.binary }} ;;
             macos*) (cd "$out" && zip -q "$GITHUB_WORKSPACE/dist/${{ matrix.asset }}" ${{ matrix.binary }}) ;;
           esac
+          if [[ "${{ matrix.name }}" == linux ]]; then
+            # The download most people use: one file, with the libraries GPUI links to beside the
+            # binary. The tar.gz above stays for machines without FUSE.
+            version=${HORIZON_LAUNCHER_VERSION:-$("$out/${{ matrix.binary }}" --version | cut -d' ' -f2)}
+            bash "$GITHUB_WORKSPACE/packaging/linux/appimage.sh" \
+              "$out/${{ matrix.binary }}" "$version" ../dist
+          fi
       # The installer most people download (packaging/windows/setup.iss); the zip stays what
       # launchers update themselves from.
       - name: Windows installer
@@ -137,6 +145,11 @@ jobs:
         with:
           name: Horizon-Offline-Launcher-Setup.exe
           path: dist/Horizon-Offline-Launcher-Setup.exe
+      - uses: actions/upload-artifact@v4
+        if: matrix.name == 'linux'
+        with:
+          name: horizon-launcher-linux-x86_64.AppImage
+          path: dist/horizon-launcher-linux-x86_64.AppImage
 
   release:
     needs: [test, build]

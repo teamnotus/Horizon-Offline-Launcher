@@ -68,6 +68,9 @@ jobs:
           # Upstream folded content mods into a new mod system; the offline launcher still uses
           # this crate, so keep it and put it back in the workspace.
           git checkout origin/main -- crates/horizon-mods
+          # This fork plays offline: the game must not put Horizon's own servers in the player's
+          # servers.dat. Upstream's hook stays in the tree, but is not registered here.
+          git checkout origin/main -- crates/horizon-official/src/lib.rs
           # Upstream's shader API now checks its version while reading a pack; the fork's registry
           # still refers to the type that API removed. Keep the crate compiling on both trees.
           if ! grep -Rsq 'pub enum Api' crates/horizon-shader-api/src; then
@@ -117,6 +120,9 @@ jobs:
           ! grep -q 'download_for_owner' launcher/src/backend.rs
           grep -q 'MogBSp7EXM7IvkdnlwA5lwGb1HEu3uHTm4cHQHcnQEk=' crates/horizon-release-sign/release-keys.txt
           test -f .github/workflows/game.yml
+          ! grep -Rqs 'sculkhosting.com' launcher/src launcher/assets
+          ! grep -Rqs 'links.official_server\|pub official_server\|fn add_official' launcher/src
+          ! grep -Rqs 'horizon_official_servers::HOOKS' crates/horizon-official/src/lib.rs
       - name: Adapt the launcher to upstream's current APIs
         if: steps.sync.outputs.up_to_date == '0'
         run: |

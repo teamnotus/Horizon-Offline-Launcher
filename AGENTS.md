@@ -3,7 +3,7 @@
 ## This repository is a fork
 
 This is **Horizon Offline Launcher** (`teamnotus/Horizon-Offline-Launcher`), a fork of
-[Horizon](https://github.com/rdbtCVS/horizon). The fork changes the launcher only:
+[Horizon](https://github.com/rdbtCVS/horizon). The fork changes the launcher and one game hook:
 
 - Playing needs no Microsoft account (`launcher/src/account.rs`: `launch` never refuses;
   `session_for_game` gives an offline start when there is no session). An account is optional, for
@@ -16,6 +16,9 @@ This is **Horizon Offline Launcher** (`teamnotus/Horizon-Offline-Launcher`), a f
   Modrinth App.
 - Updates come only from this fork (`backend::REPO = teamnotus/Horizon-Offline-Launcher`, also `horizon-server`'s update.rs), signed with its own key (`crates/horizon-release-sign/release-keys.txt`; the private key is the repository's
   `RELEASE_SIGNING_KEY` secret). The launcher updates itself unless `HORIZON_LAUNCHER_NO_SELF_UPDATE=1`.
+- No servers or sponsor ads are shipped: the game does not register `horizon_official_servers::HOOKS`
+  (`crates/horizon-official/src/lib.rs`), the launcher takes older Horizon entries out of `servers.dat`
+  (`server_list::remove_shipped`) and reads only Discord and website from `launcher/links.json`.
 - Releases: a `launcher@X.Y.Z` tag runs `.github/workflows/launcher.yml` (the launcher, GitHub's
   "latest" release, with the Windows installer `Horizon-Offline-Launcher-Setup.exe` from
   `packaging/windows/setup.iss`, install.ps1 and install.sh). The game ships as Nightlies built from

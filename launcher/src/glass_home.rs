@@ -99,7 +99,7 @@ impl Launcher {
             .pt(px(64. - crate::glass::CONTENT_INSET))
             .child(self.edition_tabs(java.is_some(), cx))
             .child(self.home_title(cx))
-            .child(self.played_text(cx))
+            .child(self.played_text())
             .child(actions)
     }
 
@@ -211,7 +211,7 @@ impl Launcher {
 
     /// "You've played for 41 h 06 min! Last played today.", or how long it has run now; then
     /// the players counts the launcher knows (not in the mockup).
-    fn played_text(&self, cx: &mut Context<Self>) -> Div {
+    fn played_text(&self) -> Div {
         let line = match (self.client_since, self.selected_instance()) {
             (Some(since), _) => trf(
                 "Playing for {time} now. Have fun!",
@@ -248,22 +248,6 @@ impl Launcher {
                 }
             })
         });
-        let official = self.official_players.map(|count| {
-            link(
-                "official-players",
-                format!(
-                    "· {}",
-                    trf(
-                        "{count} on the official SMP",
-                        &[("count", &thousands(count))]
-                    )
-                ),
-            )
-            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.go(Page::Servers);
-                cx.notify();
-            }))
-        });
         ui::text(15., FontWeight::NORMAL, ink::STRONG)
             .mt(px(16.))
             .flex()
@@ -271,7 +255,6 @@ impl Launcher {
             .gap(px(4.))
             .child(line)
             .children(playing)
-            .children(official)
     }
 
     /// Play and its ⋯ menu (`PlayGroup`): Stop while the game runs, Update when the launcher's

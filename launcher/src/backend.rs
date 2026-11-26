@@ -876,19 +876,12 @@ pub fn installable_updates(releases: &[Release]) -> Vec<Release> {
 /// How often a launcher left open looks for new releases: they come out several times a day.
 pub const CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-/// The community, sponsor and website links and the official server's address, from
-/// `launcher/links.json` on main, so they can change without a launcher release. An empty address
-/// hides its button (an empty `official_server`: no official server offered).
+/// The community and website links from `launcher/links.json` on main, so they can change without
+/// a launcher release. An empty address hides its button.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct Links {
     pub discord: String,
-    pub sponsor: String,
     pub website: String,
-    /// The official server's address, as servers.dat lists it (`server_list::add_official`).
-    pub official_server: String,
-    /// The addresses it had before: a list holding one moves to `official_server`. A move appends
-    /// the old address here.
-    pub official_server_previous: Vec<String>,
 }
 
 impl Default for Links {
@@ -896,42 +889,24 @@ impl Default for Links {
     fn default() -> Self {
         Self {
             discord: "https://discord.gg/playhorizon".into(),
-            sponsor: "https://github.com/sponsors/ludovic111".into(),
             website: "https://playhorizon.dev".into(),
-            official_server: crate::server_list::OFFICIAL_ADDRESS.into(),
-            official_server_previous: crate::server_list::OFFICIAL_PREVIOUS
-                .iter()
-                .map(|a| a.to_string())
-                .collect(),
         }
     }
 }
 
 impl Links {
     /// Reads links.json. A key that is missing keeps its default, an empty one hides the link,
-    /// and text that is not a JSON object gives the defaults.
+    /// and text that is not a JSON object gives the defaults. Sponsor and server keys are ignored:
+    /// this fork shows neither.
     pub fn parse(text: &str) -> Self {
         let mut links = Self::default();
         if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(text) {
             for (key, slot) in [
                 ("discord", &mut links.discord),
-                ("sponsor", &mut links.sponsor),
                 ("website", &mut links.website),
-                ("official_server", &mut links.official_server),
             ] {
                 if let Some(url) = map.get(key).and_then(|v| v.as_str()) {
                     *slot = url.trim().to_string();
-                }
-            }
-            // A list of addresses; anything else keeps the built-in one.
-            if let Some(serde_json::Value::Array(previous)) = map.get("official_server_previous") {
-                if previous.iter().all(serde_json::Value::is_string) {
-                    links.official_server_previous = previous
-                        .iter()
-                        .filter_map(|a| a.as_str())
-                        .map(|a| a.trim().to_string())
-                        .filter(|a| !a.is_empty())
-                        .collect();
                 }
             }
         }
@@ -4209,9 +4184,6 @@ pub enum Msg {
     PackDone(Result<Box<crate::modpacks::Imported>, String>),
     /// How many play Horizon now, or none when the server can't be reached (`telemetry`).
     Playing(Option<u64>),
-    /// How many play on the official server now, or none when it doesn't answer its status ping
-    /// (`telemetry::watch_official`).
-    OfficialPlayers(Option<u64>),
     /// Where the native-mods build is (`native_mods::Step::label`).
     NativeProgress(String),
     /// The native-mods build ended: the version built, or why not.
@@ -4429,13 +4401,6 @@ pub struct Settings {
     /// one now (the owner gate's screen).
     #[serde(default)]
     pub owner_notice_seen: bool,
-    /// Seconds a partner banner (the sidebar's card or the Servers page's banner) has been on
-    /// screen, over every start, up to `partner::SEEN_BEFORE_HIDE`: only then can the player hide it.
-    #[serde(default)]
-    pub partner_seen_secs: u64,
-    /// The player hid a partner banner: the sidebar's card and the Servers page's banner are both gone for good.
-    #[serde(default)]
-    pub partner_hidden: bool,
     /// What the window does while the game runs. Stays by default.
     #[serde(default)]
     pub while_playing: WhilePlaying,
@@ -6261,7 +6226,6 @@ pub fn {f}("
     fn links_fall_back_to_the_built_in_ones() {
         let defaults = Links::default();
         assert_eq!(defaults.discord, "https://discord.gg/playhorizon");
-        assert_eq!(defaults.sponsor, "https://github.com/sponsors/ludovic111");
         assert_eq!(defaults.website, "https://playhorizon.dev");
         // The file on main says the same thing as the defaults.
         assert_eq!(Links::parse(include_str!("../links.json")), defaults);
@@ -6279,15 +6243,19 @@ pub fn {f}("
             }
         );
         assert_eq!(
-            Links::parse(r#"{"discord": "", "sponsor": " "}"#),
+            Links::parse(r#"{"discord": "", "website": " "}"#),
             Links {
                 discord: String::new(),
-                sponsor: String::new(),
-                ..defaults.clone()
+                website: String::new(),
             }
         );
-        // A key this launcher does not know is ignored.
-        assert_eq!(Links::parse(r#"{"mastodon": "https://x.y/z"}"#), defaults);
+        // Sponsor and server keys, like any other unknown key, are ignored.
+        assert_eq!(
+            Links::parse(
+                r#"{"sponsor": "https://x.y/s", "official_server": "play.example", "mastodon": "https://x.y/z"}"#
+            ),
+            defaults
+        );
     }
 
     #[test]

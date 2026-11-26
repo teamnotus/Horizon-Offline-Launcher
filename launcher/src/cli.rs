@@ -837,7 +837,7 @@ enum Cmd {
     },
     /// Show a release's patch notes (default: the newest)
     Notes { tag: Option<String> },
-    /// Show the Discord, sponsor and website links
+    /// Show the Discord and website links
     Links,
     /// Microsoft accounts: list them (the default), sign in, sign out, or pick the one that plays
     Account {
@@ -1599,11 +1599,7 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
             if as_json {
                 json(serde_json::to_value(&links).unwrap());
             } else {
-                for (name, url) in [
-                    ("Discord", &links.discord),
-                    ("Sponsor", &links.sponsor),
-                    ("Website", &links.website),
-                ] {
+                for (name, url) in [("Discord", &links.discord), ("Website", &links.website)] {
                     println!("{name:<8} {}", if url.is_empty() { "(none)" } else { url });
                 }
             }

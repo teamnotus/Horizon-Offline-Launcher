@@ -10,16 +10,15 @@ use std::fs;
 use std::path::Path;
 
 const FILE: &str = "servers.dat";
-/// Horizon's official survival server, named as the game lists it. Its address comes from
-/// `launcher/links.json` on main (`backend::Links`), so a move to a new host needs no release.
-pub const OFFICIAL_NAME: &str = "Horizon Official";
-/// The official server's address until links.json is read, and when it can't be.
-pub const OFFICIAL_ADDRESS: &str = horizon_telemetry::server_status::OFFICIAL_ADDRESS;
-/// Addresses the official server had before: lists that still hold one are moved to the current one.
-pub const OFFICIAL_PREVIOUS: &[&str] = horizon_telemetry::server_status::OFFICIAL_PREVIOUS;
-/// Beside servers.dat once the official server was offered, so a player who removes it never
-/// gets it back: the address offered, so a new one moves the list once. The game writes the same file.
-const OFFICIAL_MARKER: &str = "horizon_official_server.txt";
+/// The addresses older launchers put in players' lists without asking. This fork never adds a
+/// server; it only takes these entries out when the Multiplayer list is read.
+const SHIPPED_ADDRESSES: &[&str] = &[
+    horizon_telemetry::server_status::OFFICIAL_PREVIOUS[0],
+    horizon_addresses::WITHDRAWN_PARTNER_SERVER,
+];
+const SHIPPED_ADDRESS: &str = horizon_telemetry::server_status::OFFICIAL_ADDRESS;
+/// Written beside servers.dat when the official server was offered. Removed with the entry.
+const SHIPPED_MARKER: &str = "horizon_official_server.txt";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Server {
@@ -175,67 +174,27 @@ impl List {
             .and_then(|()| fs::rename(&new, &current));
         written.map_err(|e| format!("Could not save the server list: {e}"))
     }
-
-    /// Points the entries for a previous official address at `address`, each keeping the player's
-    /// name, picture and every other field. The shown list keeps one entry for the server: an old
-    /// one goes when the list already has `address`. Whether anything changed.
-    fn move_official(&mut self, address: &str, previous: &[String]) -> bool {
-        let old = |ip: &str| {
-            !same_address(ip, address)
-                && previous
-                    .iter()
-                    .any(|p| !p.trim().is_empty() && same_address(ip, p))
-        };
-        let mut shown = self.servers().iter().any(|s| same_address(&s.ip, address));
-        let mut changed = false;
-        self.entries.retain_mut(|e| {
-            if !old(&text(e, "ip")) {
-                return true;
-            }
-            changed = true;
-            if !hidden(e) {
-                if shown {
-                    return false;
-                }
-                shown = true;
-            }
-            e.insert(key("ip"), Tag::String(address.into()));
-            true
-        });
-        changed
-    }
 }
 
-/// Puts the official server at `address` first in the list in `home`, once: not again after the
-/// player removes it, and not when the list already has its address. When the server moved (the
-/// address differs from the one offered last), the entries for its `previous` addresses move to
-/// the new one, once, and it is not offered again to a player who removed it. A list that can't be
-/// read is left alone; an empty `address` changes nothing.
-pub fn add_official(home: &Path, address: &str, previous: &[String]) -> Result<(), String> {
-    let address = address.trim();
-    if address.is_empty() {
-        return Ok(());
-    }
-    let marker = home.join(OFFICIAL_MARKER);
-    // A marker that is there but can't be read: offered already, at an address not known.
-    let offered = match fs::read_to_string(&marker) {
-        Ok(text) => Some(text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(_) => Some(String::new()),
-    };
-    if offered.as_deref().is_some_and(|a| same_address(a, address)) {
-        return Ok(());
-    }
+/// Takes the servers older launchers shipped out of the player's list. Their names, pictures and
+/// every other field go with them; a server the player added at another address stays. A list that
+/// can't be read is left alone. The marker is removed even when there is no entry to take out.
+pub fn remove_shipped(home: &Path) -> Result<(), String> {
     let mut list = List::read(home).ok_or("The server list can't be read.")?;
-    let mut changed = list.move_official(address, previous);
-    if offered.is_none() && !list.servers().iter().any(|s| same_address(&s.ip, address)) {
-        list.entries.insert(0, entry(OFFICIAL_NAME, address));
-        changed = true;
-    }
-    if changed {
+    let before = list.entries.len();
+    list.entries.retain(|e| {
+        let ip = text(e, "ip");
+        !same_address(&ip, SHIPPED_ADDRESS)
+            && !SHIPPED_ADDRESSES.iter().any(|a| same_address(&ip, a))
+    });
+    if list.entries.len() != before {
         list.save(home)?;
     }
-    fs::write(marker, format!("{address}\n")).map_err(|e| e.to_string())
+    match fs::remove_file(home.join(SHIPPED_MARKER)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// The shown server a command names: its position from 1, its name (any case) or its address.
