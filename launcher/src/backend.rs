@@ -5223,9 +5223,9 @@ pub fn {f}("
                 named == 2 || (optional && named > 2),
                 "game.yml must sign and publish {game} ({os} {arch})"
             );
-            // This fork doesn't publish macOS launcher builds: GitHub kept cancelling those jobs
-            // for lack of a runner, and they aren't used here. Macs still get the game assets.
-            if os == "macos" {
+            // This fork publishes launcher builds only for Linux x86_64 and Windows x64. Macs
+            // still get the game assets, and Windows ARM64 still gets a game zip.
+            if os == "macos" || (os, arch) == ("windows", "aarch64") {
                 continue;
             }
             assert!(

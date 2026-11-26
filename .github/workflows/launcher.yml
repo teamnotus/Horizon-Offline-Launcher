@@ -1,5 +1,5 @@
 # Horizon Offline Launcher: tests on every push and pull request; a tag `launcher@1.2.3` builds the
-# launcher for Windows (x64 with its installer, and ARM64) and Linux (AppImage and tar.gz), signs
+# launcher for Windows x64 (with its installer) and Linux x86_64 (AppImage and tar.gz), signs
 # the checksums and publishes them as a GitHub release, which launchers already installed update
 # themselves from.
 name: launcher
@@ -49,20 +49,11 @@ jobs:
             binary: horizon-launcher.exe
             asset: horizon-launcher-windows-x64.zip
             rustflags: -C target-feature=+crt-static
-          # Windows on ARM: the same runner, another target. Optional: a release goes out without it.
-          - name: windows-arm64
-            os: windows-latest
-            target: aarch64-pc-windows-msvc
-            binary: horizon-launcher.exe
-            asset: horizon-launcher-windows-arm64.zip
-            rustflags: -C target-feature=+crt-static
-            optional: true
           - name: linux
             os: ubuntu-22.04
             binary: horizon-launcher
             asset: horizon-launcher-linux-x86_64.tar.gz
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.optional == true }}
     timeout-minutes: 60
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
@@ -73,8 +64,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: launcher
@@ -88,11 +77,11 @@ jobs:
         run: |
           echo "HORIZON_LAUNCHER_VERSION=${GITHUB_REF_NAME#launcher@}" >> "$GITHUB_ENV"
           echo "HORIZON_LAUNCHER_TAG=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
-      - run: cargo build --release --locked ${LAUNCHER_FEATURES:+--features "$LAUNCHER_FEATURES"} ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+      - run: cargo build --release --locked ${LAUNCHER_FEATURES:+--features "$LAUNCHER_FEATURES"}
       - name: Package
         run: |
           mkdir -p ../dist
-          out=target/release; [[ -n "${{ matrix.target }}" ]] && out="target/${{ matrix.target }}/release"
+          out=target/release
           case "${{ matrix.name }}" in
             windows*) 7z a -tzip ../dist/${{ matrix.asset }} "./$out/${{ matrix.binary }}" > /dev/null ;;
             linux) tar -czf ../dist/${{ matrix.asset }} -C "$out" ${{ matrix.binary }} ;;
@@ -136,7 +125,6 @@ jobs:
 
   release:
     needs: [test, build]
-    # The ARM64 Windows build is optional: the release goes out with whatever was built.
     if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/launcher@') && needs.test.result == 'success' && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
@@ -153,6 +141,17 @@ jobs:
         run: |
           [[ -n "$RELEASE_SIGNING_KEY" ]] || { echo "::error::The RELEASE_SIGNING_KEY secret is not set"; exit 1; }
           bash tools/ci/sign_release.sh "$GITHUB_REF_NAME" dist/*
+      - name: The Linux binaries start and say this release's version
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#launcher@}
+          chmod +x dist/horizon-launcher-linux-x86_64.AppImage
+          got=$(dist/horizon-launcher-linux-x86_64.AppImage --appimage-extract-and-run --version | cut -d' ' -f2)
+          [[ "$got" == "$version" ]] || { echo "AppImage is $got, expected $version"; exit 1; }
+          tmp=$(mktemp -d)
+          tar -xzf dist/horizon-launcher-linux-x86_64.tar.gz -C "$tmp"
+          got=$("$tmp/horizon-launcher" --version | cut -d' ' -f2)
+          [[ "$got" == "$version" ]] || { echo "tar.gz is $got, expected $version"; exit 1; }
       - uses: dtolnay/rust-toolchain@stable
       - name: The signature, checked as launchers check it
         run: cargo run --locked --quiet -p horizon-release-sign -- verify --tag "$GITHUB_REF_NAME" dist

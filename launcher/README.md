@@ -162,9 +162,11 @@ The opening, then Play ([clip](docs/opening.webm)):
   (`horizon_launcher::shortcut`). **Remove shortcut** moves it to the trash; it is found by the
   instance id inside it, so a rename doesn't lose it. `horizon-launcher instance shortcut
   [instance] [--remove]`; `HORIZON_LAUNCHER_DESKTOP` points it at another folder.
-- **Accounts and quick switch**: the top bar's account chip opens a menu of everyone who can play:
-  each signed-in Microsoft account, the offline names the player keeps, and the name the game
-  made up (`horizon-player.txt`). Picking one plays as it from the next Play. Offline names play
+- **Accounts and quick switch**: the first Play with no player chosen opens a small name field on
+  the spot, prefilled with the name the game made up: type yours and press Enter. The name is kept
+  for later plays, in `accounts.json` and in each game folder's `horizon-player.txt`. The top bar's
+  account chip opens a menu of everyone who can play: each signed-in Microsoft account and the
+  offline names the player keeps. Picking one plays as it from the next Play. Offline names play
   only while an account that owns the game is signed in ([Microsoft accounts](#microsoft-accounts));
   signing the last one out keeps them, unplayable until one is back. Settings > Account
   adds offline names (3 to 16 letters, digits or `_`; the game gets `--name`) and forgets them,
@@ -488,8 +490,9 @@ The window, the command line and the MCP server all call the same core, `src/bac
 
 ## Microsoft accounts
 
-An account is optional: without one, Play starts the game offline, under an offline name or the
-game's own. Preparing a version needs only your own Minecraft install. Settings → Accounts signs
+An account is optional: without one, the first Play asks you to type an offline name (3 to 16
+letters, digits or `_`), then starts the game. Preparing a version needs only your own Minecraft
+install. Settings → Accounts signs
 in: the launcher shows a code, you enter it at microsoft.com/link, and the launcher checks that the
 account owns the game. A signed-in account plays online-mode servers under your own name and skin,
 and lets Horizon download Minecraft from Mojang ("Download and prepare"). Tokens live in the system keychain (Keychain,

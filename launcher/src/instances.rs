@@ -710,22 +710,26 @@ fn follow_player(game_home: &Path, home: &Path) {
     }
 }
 
-/// A fresh made-up name everywhere the game keeps one: `horizon-player.txt` is per game
-/// folder (`PLAYER_FILES`), so the same new name goes to the default home and every
-/// instance's — the player stays one player in its worlds. The file's `name:` line and the
-/// `Player` + five digits scheme are horizon-client's (`offline_name.rs`).
-pub fn new_player_name() -> Result<String, String> {
-    new_player_name_in(&backend::game_home(), &backend::data_dir())
-}
-
-fn new_player_name_in(game_home: &Path, data: &Path) -> Result<String, String> {
+/// A made-up name for the player to confirm or replace before the first game starts.
+/// The `Player` + five digits scheme is horizon-client's (`offline_name.rs`).
+pub fn suggest_player_name() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64);
-    let name = format!(
+    format!(
         "Player{:05}",
         (nanos ^ u64::from(std::process::id()).rotate_left(32)) % 100_000
-    );
+    )
+}
+
+/// Keeps a chosen offline name everywhere the game keeps one: `horizon-player.txt` is per
+/// game folder (`PLAYER_FILES`), so the same name goes to the default home and every
+/// instance's — the player stays one player in its worlds.
+pub fn write_player_name(name: &str) -> Result<(), String> {
+    write_player_name_in(&backend::game_home(), &backend::data_dir(), name)
+}
+
+fn write_player_name_in(game_home: &Path, data: &Path, name: &str) -> Result<(), String> {
     for instance in list_in(game_home, data) {
         if instance.home.is_dir() {
             fs::write(
@@ -735,6 +739,17 @@ fn new_player_name_in(game_home: &Path, data: &Path) -> Result<String, String> {
             .map_err(|e| format!("{}: {e}", instance.home.display()))?;
         }
     }
+    Ok(())
+}
+
+/// A fresh made-up name everywhere, when no name was chosen.
+pub fn new_player_name() -> Result<String, String> {
+    new_player_name_in(&backend::game_home(), &backend::data_dir())
+}
+
+fn new_player_name_in(game_home: &Path, data: &Path) -> Result<String, String> {
+    let name = suggest_player_name();
+    write_player_name_in(game_home, data, &name)?;
     Ok(name)
 }
 

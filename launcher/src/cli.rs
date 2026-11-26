@@ -12,7 +12,7 @@ use horizon_launcher::native_mods;
 use horizon_launcher::native_status;
 use horizon_launcher::other_launchers;
 use horizon_launcher::server_list;
-use std::io::{IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -1229,6 +1229,41 @@ fn attached(cmd: Command) -> Result<(), String> {
     }
 }
 
+/// In a terminal, the first `play` with no chosen player asks for an offline name, as the
+/// window does. Pipelines and MCP get the made-up name without a question that would hang them.
+fn ask_offline_name(accounts: &mut Accounts, as_json: bool) -> Result<(), String> {
+    if as_json || !io::stdin().is_terminal() || accounts.player() != account::Player::GameName {
+        return Ok(());
+    }
+    let suggested = instances::suggest_player_name();
+    let mut typed = String::new();
+    loop {
+        print!("{}", trf("Offline name [{name}]: ", &[("name", &suggested)]));
+        io::stdout().flush().map_err(|e| e.to_string())?;
+        typed.clear();
+        match io::stdin().lock().read_line(&mut typed) {
+            Ok(0) => {
+                println!();
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        let name = typed.trim();
+        let name = if name.is_empty() {
+            suggested.as_str()
+        } else {
+            name
+        };
+        if account::valid_offline_name(name) {
+            accounts.play_as(account::store(), account::Player::Offline(name.to_string()))?;
+            accounts.save()?;
+            return instances::write_player_name(name);
+        }
+        eprintln!("{}", tr("Use 3 to 16 letters, numbers or _."));
+    }
+}
+
 fn release_json(r: &Release) -> serde_json::Value {
     serde_json::json!({
         "tag": r.tag, "name": r.name, "date": r.date, "prerelease": r.prerelease,
@@ -1526,6 +1561,8 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
             };
             if let Some(who) = &who {
                 accounts.play_as(account::store(), who.clone())?;
+            } else {
+                ask_offline_name(&mut accounts, as_json)?;
             }
             let mut cmd =
                 backend::client_as(&instance.resolve_version(version.as_deref())?, who.as_ref())?;

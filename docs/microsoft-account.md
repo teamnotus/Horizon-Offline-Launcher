@@ -1,5 +1,9 @@
 # Microsoft account sign-in and online-mode play
 
+> This fork: an account is optional. With no player chosen, the first Play asks for an offline
+> name in place; offline names and offline play work without a Microsoft account. The rest of this
+> note is upstream's design for authenticated play.
+
 Horizon signs players in with their Microsoft account in the launcher and joins online-mode
 (authenticated) servers like vanilla 26.3 does. The launcher plays only with an account that owns
 Minecraft: Java Edition ([the owner gate](#the-owner-gate)), as that account, on LAN and

@@ -95,6 +95,30 @@ fn a_new_player_name_replaces_the_kept_one_everywhere() {
 }
 
 #[test]
+fn a_chosen_player_name_replaces_the_kept_one_everywhere() {
+    let root = scratch("chosenname");
+    let (home, data) = (root.join("horizon"), root.join("launcher"));
+    player_home(&home);
+    put(
+        &home.join("instances/one/horizon-player.txt"),
+        "name:Player123\n",
+    );
+    fs::create_dir_all(home.join("instances/two")).unwrap();
+    write_player_name_in(&home, &data, "Chosen_1").unwrap();
+    let kept = |home: &Path| fs::read_to_string(home.join("horizon-player.txt")).unwrap();
+    for h in [
+        &home,
+        &home.join("instances/one"),
+        &home.join("instances/two"),
+        &home.join("ports/small-pack/home"),
+        &home.join("horizon-packs/cozy/home"),
+    ] {
+        assert_eq!(kept(h), "name:Chosen_1\n", "{}", h.display());
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn existing_worlds_stay_where_they_are_and_every_folder_becomes_an_instance() {
     let root = scratch("migrate");
     let (home, data) = (root.join("horizon"), root.join("launcher"));

@@ -4,6 +4,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod agents_page;
+mod ask_name;
 mod art;
 mod blocks;
 mod cli;
@@ -381,6 +382,8 @@ struct Launcher {
     owner: Option<bool>,
     /// Play was refused (or Home's Sign in pressed): the owner gate's screen is open.
     owner_screen_open: bool,
+    /// The offline-name prompt waiting for the game it will start (`ask_name.rs`).
+    ask_name: Option<ask_name::AskName>,
     /// Clicks on the sidebar's launcher version, and whether they revealed the developer options
     /// (`dev_options`) for this run.
     dev_clicks: u8,
@@ -665,6 +668,7 @@ impl Launcher {
             keychain: None,
             owner: None,
             owner_screen_open: false,
+            ask_name: None,
             dev_clicks: 0,
             dev_options: false,
             starting_client: None,
@@ -1843,6 +1847,17 @@ impl Launcher {
     /// Starts the game: the session first (a network round trip when the token needs
     /// renewing), then `drain` starts the process when it arrives.
     fn start_client(&mut self, tag: String) {
+        // No player chosen: ask here, on the page Play was pressed on. `horizon-player.txt` is
+        // only a made-up name, so it isn't a choice and doesn't skip the question.
+        if self.ask_name.is_none() && Accounts::load().player() == account::Player::GameName {
+            let suggested = self
+                .offline_name
+                .clone()
+                .filter(|name| account::valid_offline_name(name))
+                .unwrap_or_else(instances::suggest_player_name);
+            self.ask_name = Some(ask_name::AskName::new(tag, suggested));
+            return;
+        }
         self.client_error = None;
         self.crash = None;
         self.prepare_log.clear();
@@ -5239,6 +5254,7 @@ impl Render for Launcher {
         self.github.note_focus(window);
         self.args_focused = self.args_focus.is_focused(window);
         self.proxy_focused = self.proxy_focus.is_focused(window);
+        self.note_ask_name_focus(window, cx);
         let size = window.viewport_size();
         self.window_width = f32::from(size.width);
         self.window_long_side = f32::from(size.width).max(f32::from(size.height));
@@ -5320,6 +5336,7 @@ impl Render for Launcher {
                             window.focus_next(cx);
                         }
                     }
+                    "escape" if this.ask_name_escape(window, cx) => {}
                     "escape" if this.native_log_escape() => {}
                     "escape" if this.servers_escape() => {}
                     "escape" if this.instance_escape() => {}
@@ -5334,6 +5351,9 @@ impl Render for Launcher {
             // ⌘K (Ctrl+K elsewhere) wherever the focus is, even in a field: the palette.
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 let k = &ev.keystroke;
+                if this.ask_name.is_some() {
+                    return;
+                }
                 let command = if cfg!(target_os = "macos") {
                     k.modifiers.platform
                 } else {
@@ -5460,6 +5480,9 @@ impl Render for Launcher {
         }
         if self.asking_owner() {
             root = root.child(self.owner_screen(cx));
+        }
+        if let Some(dialog) = self.ask_name_dialog(cx) {
+            root = root.child(dialog);
         }
         if let Some(opening) = &self.opening {
             // The wordmark arrives letter by letter, then gives way to the launcher; a click or
