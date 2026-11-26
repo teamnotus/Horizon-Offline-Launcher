@@ -57,7 +57,7 @@ jobs:
           # also ships files the build needs, such as packaging/windows/exe.rs.
           git checkout origin/main -- packaging
           git checkout origin/main -- crates/horizon-release-sign/release-keys.txt \
-            README.md AGENTS.md install.ps1 install.sh build.ps1
+            README.md AGENTS.md install.ps1 install.sh build.ps1 docs/launcher-commands.md
           # Upstream declares hooks in Rust now; a stale fork copy makes its build script fail.
           if git cat-file -e FETCH_HEAD:native-hooks.json 2>/dev/null; then
             git checkout origin/main -- native-hooks.json
@@ -195,6 +195,12 @@ jobs:
                             f'        star: {star},\n        mood: Mood::Plain,\n        land: Land::Plain,\n    }},', 1)
           p.write_text(s)
           PY
+          fi
+          # Upstream moved the game's executable into horizon-game and the global allocator
+          # into the client library. Keep the old generated main for mods pinned to older
+          # revisions; adapt the launcher to the new one when the staged tree has it.
+          if [ ! -f crates/horizon-client/src/main.rs ] && [ -f crates/horizon-game/src/main.rs ]; then
+            python3 .github/scripts/adapt_upstream.py
           fi
           git add -A
       - name: Rebuild the exporter classes when the pinned game files change
